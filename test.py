@@ -18,7 +18,7 @@ except OSError as e:
     sys.exit(1)
 
 # Настраиваем типы
-lib.set_key.argtypes = [ctypes.c_char]  # char для ключа
+lib.set_key.argtypes = [ctypes.c_char]
 lib.set_key.restype = None
 
 lib.caesar.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]  
@@ -30,22 +30,22 @@ with open(input_file, 'rb') as f:
 len_data = len(data)
 
 # Создаём буфер для данных
-buffer = bytearray(data)  # Копируем в изменяемый буфер
+buffer = ctypes.create_string_buffer(data, len_data)  # Копируем в изменяемый буфер
 
 # Устанавливаем ключ
-lib.set_key(key_char.encode('utf-8')[0])
+lib.set_key(ord(key_char))
 
 # Вызываем caesar src == dst
-lib.caesar(buffer, buffer, len_data)  # Библиотека сама скастует bytearray к нужному типу
+lib.caesar(buffer, buffer, len_data)
 
 # Записываем результат в output file в binary mode
 with open(output_file, 'wb') as f:
-    f.write(buffer)
+    f.write(buffer.raw[:len_data])
 
 print(f"Processed {input_file} -> {output_file} with key '{key_char}'")
 
 # Для проверки: двойной XOR должен вернуть оригинал
 lib.caesar(buffer, buffer, len_data)
 with open("decrypted.txt", 'wb') as f:  
-    f.write(buffer)
+    f.write(buffer.raw[:len_data])
 print("Double XOR check: decrypted.txt should match input.txt")
