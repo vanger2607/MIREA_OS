@@ -1,8 +1,13 @@
-#ifndef CAESAR_H // проверка, что CAESAR_H не был объявлен до этого
+#ifndef CAESAR_H
 #define CAESAR_H
 
-extern char* caesar_encrypt(const char* text, int shift); // extern, чтобы показать, что мы объявляем функции, реализованы они будут в другом файле
-extern char* caesar_decrypt(const char* text, int shif);
 
-#endif
 
+// Устанавливает ключ шифрования (один байт)
+void set_key(char key);
+
+// Выполняет XOR-шифрование/дешифрование len байт из src в dst
+// src и dst могут быть одним и тем же буфером
+void caesar(void* src, void* dst, int len);
+
+#endif 
