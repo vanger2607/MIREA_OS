@@ -1,13 +1,19 @@
 #ifndef CAESAR_H
 #define CAESAR_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-
-// Устанавливает ключ шифрования (один байт)
+// Установка ключа для XOR-преобразования
 void set_key(char key);
 
-// Выполняет XOR-шифрование/дешифрование len байт из src в dst
-// src и dst могут быть одним и тем же буфером
+// Функция шифрования/дешифрования (XOR симметричен)
 void caesar(void* src, void* dst, int len);
 
-#endif 
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
