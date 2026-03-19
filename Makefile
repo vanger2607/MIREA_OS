@@ -56,7 +56,7 @@ test: all input.txt
 test_2: all output.txt
 	cat output.txt | ./secure_copy output_decrypted.txt 77
 clean:
-	rm -f *.o *.so secure_copy output.txt output_decrypted.txt input.txt
+	rm -f *.o *.so secure_copy output.txt output_decrypted.txt input.txt file*.txt
 # удаляем все промежуточные .o, библиотеку .so, бинарник программы и текстовые файлы.
 
 .PHONY: all install test clean # Говорим make, что эти цели - не файлы, а абстрактные действия
