@@ -18,8 +18,8 @@
 #include "caesar.h"
 
 const size_t BLOCK_SIZE = 4096;
-const int MAX_COUNT = 4; // Ограничение на 4 потока по PDF
-// Флаг для сигналов  volatile sig_atomic_t
+const int MAX_COUNT = 4; // Ограничение по потокам
+// Флаг для сигналов остается volatile sig_atomic_t
 volatile sig_atomic_t keep_running = 1;
 
 void handle_sigint(int sig) {
@@ -125,12 +125,12 @@ int main(int argc, char* argv[]) {
     std::string mode = "auto";
     int start_idx = 1;
 
-    // Парсинг флага
+    // Парсим режим
     if (argc > 1 && strncmp(argv[1], "--mode=", 7) == 0) {
         mode = argv[1] + 7;
         start_idx = 2;
         if (mode != "sequential" && mode != "parallel") {
-            std::cerr << "Error: Invalid mode. Use --mode=sequential or --mode=parallel\n";
+            std::cerr << "Error: Invalid mode. Введите верное значение режима (--mode=sequential или --mode=parallel)\n";
             return 1;
         }
     }
@@ -157,13 +157,17 @@ int main(int argc, char* argv[]) {
 
     int num_threads = (mode == "parallel") ? MAX_COUNT : 1;
 
-    std::vector<pthread_t> workers(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_create(&workers[i], nullptr, worker_func, &gctx);
-    }
-
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_join(workers[i], nullptr);
+    
+    if (num_threads == 1) {
+        worker_func(&gctx); // Без накладных расходов pthread
+    } else {
+        pthread_t workers[MAX_COUNT];
+        for (int i = 0; i < num_threads; ++i) {
+            pthread_create(&workers[i], nullptr, worker_func, &gctx);
+        }
+        for (int i = 0; i < num_threads; ++i) {
+            pthread_join(workers[i], nullptr);
+        }
     }
 
     std::cout << "\n[OK] Secure batch copy finished. Check log.txt." << std::endl;
