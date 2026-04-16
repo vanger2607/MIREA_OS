@@ -1,0 +1,5 @@
+*.txt
+input_test/
+output_test/
+stat.txt
+*log.txt
