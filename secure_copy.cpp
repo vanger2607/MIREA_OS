@@ -13,11 +13,13 @@
 #include <iomanip>
 #include <sstream>
 #include <sys/stat.h>
+#include <cstring> 
 
 #include "caesar.h"
 
 const size_t BLOCK_SIZE = 4096;
-// Флаг для сигналов остается volatile sig_atomic_t
+const int MAX_COUNT = 4; // Ограничение на 4 потока по PDF
+// Флаг для сигналов  volatile sig_atomic_t
 volatile sig_atomic_t keep_running = 1;
 
 void handle_sigint(int sig) {
@@ -118,30 +120,49 @@ void* worker_func(void* arg) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " <file1.txt> [file2.txt ...] <out_dir> <key_number>\n";
-        return 1;
+    signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
+
+    std::string mode = "auto";
+    int start_idx = 1;
+
+    // Парсинг флага
+    if (argc > 1 && strncmp(argv[1], "--mode=", 7) == 0) {
+        mode = argv[1] + 7;
+        start_idx = 2;
+        if (mode != "sequential" && mode != "parallel") {
+            std::cerr << "Error: Invalid mode. Use --mode=sequential or --mode=parallel\n";
+            return 1;
+        }
     }
 
-    signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
+    if (argc - start_idx < 3) {
+        std::cerr << "Usage: " << argv[0] << " [--mode=sequential|parallel] <file1.txt> [file2.txt ...] <out_dir> <key_number>\n";
+        return 1;
+    }
 
     char key = (char)std::atoi(argv[argc - 1]);
     std::string out_dir = argv[argc - 2];
     mkdir(out_dir.c_str(), 0777);
     std::vector<std::string> input_files;
-    for (int i = 1; i < argc - 2; ++i) {
+    for (int i = start_idx; i < argc - 2; ++i) {
         input_files.push_back(argv[i]);
     }
 
     GlobalContext gctx(key, out_dir, input_files);
 
-    const int NUM_THREADS = 3;
-    pthread_t workers[NUM_THREADS];
-    for (int i = 0; i < NUM_THREADS; ++i) {
+    bool is_auto = (mode == "auto");
+    if (is_auto) {
+        mode = (input_files.size() < 5) ? "sequential" : "parallel";
+    }
+
+    int num_threads = (mode == "parallel") ? MAX_COUNT : 1;
+
+    std::vector<pthread_t> workers(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
         pthread_create(&workers[i], nullptr, worker_func, &gctx);
     }
 
-    for (int i = 0; i < NUM_THREADS; ++i) {
+    for (int i = 0; i < num_threads; ++i) {
         pthread_join(workers[i], nullptr);
     }
 
