@@ -61,14 +61,15 @@ test_invalid_mode: all input.txt
 	fi
 
 # ТЕСТ: Проверка хеша
-test_hash: all
+test_hash: all gen_heavy
 	@echo "\n=== Проверка целостности данных (MD5 Hash) ==="
-	@mkdir -p test_hash_in test_hash_out test_hash_dec
-	@echo "Secret message for hash test" > test_hash_in/file1.txt
-	@./secure_copy test_hash_in/file1.txt test_hash_out 77 > /dev/null
-	@./secure_copy test_hash_out/file1.txt test_hash_dec 77 > /dev/null
-	@md5sum test_hash_in/file1.txt | awk '{print $$1}' > hash_orig.txt
-	@md5sum test_hash_dec/file1.txt | awk '{print $$1}' > hash_dec.txt
+	@mkdir -p test_hash_out test_hash_dec
+	@echo "[1/2] Шифруем heavy_1.bin..."
+	@./secure_copy --mode=sequential input_test/heavy_1.bin test_hash_out 77 > /dev/null
+	@echo "[2/2] Дешифруем heavy_1.bin обратно..."
+	@./secure_copy --mode=sequential test_hash_out/heavy_1.bin test_hash_dec 77 > /dev/null
+	@md5sum input_test/heavy_1.bin | awk '{print $$1}' > hash_orig.txt
+	@md5sum test_hash_dec/heavy_1.bin | awk '{print $$1}' > hash_dec.txt
 	@if diff -q hash_orig.txt hash_dec.txt > /dev/null; then \
 		echo "[УСПЕХ] Хеши полностью совпадают!"; \
 	else \

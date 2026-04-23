@@ -96,6 +96,11 @@ void* worker_func(void* arg) {
         std::string out_filepath = gctx->out_dir + "/" + filename;
 
         std::ifstream infile(filepath, std::ios::binary);
+        if (!infile) {
+            std::cerr << "\n[ERROR] Файл не существует или недоступен: " << filepath << "\n";
+            std::cerr << "Аварийное завершение программы.\n";
+            exit(EXIT_FAILURE); // Мгновенно завершаем программу с кодом ошибки
+        }
         std::ofstream outfile(out_filepath, std::ios::binary);
 
         if (infile && outfile) {
