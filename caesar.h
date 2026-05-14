@@ -5,11 +5,9 @@
 extern "C" {
 #endif
 
-// Установка ключа для XOR-преобразования
-void set_key(char key);
 
 // Функция шифрования/дешифрования (XOR симметричен)
-void caesar(void* src, void* dst, int len);
+void caesar(void* src, void* dst, int len, volatile char* secure_key_ptr);
 
 #ifdef __cplusplus
 }

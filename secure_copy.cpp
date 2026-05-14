@@ -17,12 +17,62 @@
 #include <time.h> // Для clock_gettime
 #include <x86intrin.h>
 
+#include <sys/mman.h>  // Для хранения ключа и безопасного выделения памяти
+#include <signal.h>
+
 #include "caesar.h"
 
 const size_t BLOCK_SIZE = 4096;
-const int MAX_COUNT = 4; // Ограничение по потокам
+const int MAX_COUNT = 4;
 // Флаг для сигналов остается volatile sig_atomic_t
 volatile sig_atomic_t keep_running = 1;
+
+// Глобальные переменные для защищенной памяти
+void* global_secure_memory_pointer = nullptr; 
+const size_t SECURE_MEMORY_SIZE = 16;
+
+/*
+ Функция для окончательного уничтожения данных в памяти.
+ */
+void cleanup_secure_memory() {
+    if (global_secure_memory_pointer != nullptr) {
+        // Снимаем защиту, чтобы иметь возможность записать нули
+        if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_READ | PROT_WRITE) == -1) {
+            perror("Ошибка снятия защиты при финальной очистке памяти");
+        }
+        // Затираем данные
+        memset(global_secure_memory_pointer, 0, SECURE_MEMORY_SIZE);
+        // Освобождаем ресурс
+        munmap(global_secure_memory_pointer, SECURE_MEMORY_SIZE);
+        global_secure_memory_pointer = nullptr;
+    }
+}
+
+/*
+ Обработчик ошибок сегментации (SIGSEGV).
+    Он проверяет, произошло ли нарушение доступа в защищенной области памяти, 
+    и выводит соответствующее сообщение.
+ */
+void handle_sigsegv(int signal_number, siginfo_t *signal_information, void *context) {
+    (void)signal_number;
+    (void)context;
+
+    uintptr_t fault_address = reinterpret_cast<uintptr_t>(signal_information->si_addr);
+    uintptr_t secure_start = reinterpret_cast<uintptr_t>(global_secure_memory_pointer);
+    uintptr_t secure_end = secure_start + SECURE_MEMORY_SIZE;
+
+    if (global_secure_memory_pointer != nullptr && fault_address >= secure_start && fault_address < secure_end) {
+        std::cerr << "\n[SECURITY ERROR] Попытка модификации защищенного ключа!\n";
+    } else {
+        std::cerr << "\n[SEGFAULT ERROR] Обычная ошибка доступа к памяти.\n";
+    }
+    
+    // Затираем ключ
+    cleanup_secure_memory();
+    
+    std::cerr << "Ресурсы очищены. Аварийное завершение.\n";
+    exit(EXIT_FAILURE); 
+}
 
 void handle_sigint(int sig) {
     (void)sig;
@@ -36,13 +86,13 @@ void handle_sigint(int sig) {
 struct GlobalContext {
     std::vector<std::string> input_files;
     std::string out_dir;
-    char key;
+    std::mutex key_access_mutex; // Мьютекс для синхронизации изменения прав доступа
     std::atomic<size_t> file_idx{0}; 
     std::mutex log_mutex;
     std::ofstream log_file;
 
-    GlobalContext(char k, const std::string& dir, const std::vector<std::string>& files) 
-        : input_files(files), out_dir(dir), key(k) {
+    GlobalContext(const std::string& dir, const std::vector<std::string>& files) 
+        : input_files(files), out_dir(dir) {
         log_file.open("log.txt", std::ios::app);
     }
     ~GlobalContext() {
@@ -79,8 +129,6 @@ void log_message(GlobalContext* gctx, const std::string& filename) {
  */
 void* worker_func(void* arg) {
     GlobalContext* gctx = static_cast<GlobalContext*>(arg);
-    // Передаем ключ в библиотеку
-    set_key(gctx->key);
 
     while (keep_running) {
         size_t idx = gctx->file_idx.fetch_add(1, std::memory_order_relaxed);
@@ -99,7 +147,8 @@ void* worker_func(void* arg) {
         if (!infile) {
             std::cerr << "\n[ERROR] Файл не существует или недоступен: " << filepath << "\n";
             std::cerr << "Аварийное завершение программы.\n";
-            exit(EXIT_FAILURE); // Мгновенно завершаем программу с кодом ошибки
+            cleanup_secure_memory(); // Очищаем память перед аварийным выходом
+            exit(EXIT_FAILURE); 
         }
         std::ofstream outfile(out_filepath, std::ios::binary);
 
@@ -112,7 +161,30 @@ void* worker_func(void* arg) {
                 // смотрим сколько реально прочитали
                 size_t read_bytes = infile.gcount();
                 if (read_bytes > 0) {
-                    caesar(buffer, buffer, (int)read_bytes);
+                    
+                    // --- КРИТИЧЕСКАЯ СЕКЦИЯ ШИФРОВАНИЯ ---
+                    gctx->key_access_mutex.lock(); 
+
+                    // 1. Открываем защищенную память только для чтения
+                    if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_READ) == -1) {
+                        perror("Ошибка mprotect (разрешение чтения)");
+                        cleanup_secure_memory();
+                        exit(EXIT_FAILURE);
+                    }
+                    
+                    // 2. Передаем указатель в библиотеку
+                    caesar(buffer, buffer, (int)read_bytes, (volatile char*)global_secure_memory_pointer);
+                    
+                    // 3. Закрываем доступ
+                    if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE) == -1) {
+                        perror("Ошибка mprotect (запрет доступа)");
+                        cleanup_secure_memory();
+                        exit(EXIT_FAILURE);
+                    }
+
+                    gctx->key_access_mutex.unlock();
+                    // --- КОНЕЦ КРИТИЧЕСКОЙ СЕКЦИИ ---
+
                     // пишем ровно столько байт, сколько было прочитано
                     outfile.write(reinterpret_cast<char*>(buffer), read_bytes);
                 }
@@ -125,7 +197,6 @@ void* worker_func(void* arg) {
     }
     return nullptr;
 }
-
 
 void print_stats(const std::string& mode, double total_time, unsigned long long total_ticks, size_t file_count) {
     double avg = (file_count > 0) ? total_time / file_count : 0.0;
@@ -191,6 +262,17 @@ void print_auto_comparison(const std::string& mode, double total_time, unsigned 
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
+    
+    // Регистрация расширенного обработчика ошибок сегментации 
+    struct sigaction signal_action;
+    signal_action.sa_flags = SA_SIGINFO; 
+    sigemptyset(&signal_action.sa_mask);
+    signal_action.sa_sigaction = handle_sigsegv;
+    if (sigaction(SIGSEGV, &signal_action, NULL) == -1) {
+        perror("Ошибка при регистрации обработчика SIGSEGV");
+        cleanup_secure_memory();
+        return 1;
+    }
 
     std::string mode = "auto";
     int start_idx = 1;
@@ -210,15 +292,45 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    char key = (char)std::atoi(argv[argc - 1]);
     std::string out_dir = argv[argc - 2];
     mkdir(out_dir.c_str(), 0777);
     std::vector<std::string> input_files;
+
     for (int i = start_idx; i < argc - 2; ++i) {
         input_files.push_back(argv[i]);
     }
 
-    GlobalContext gctx(key, out_dir, input_files);
+    // Выделение защищенной памяти
+    global_secure_memory_pointer = mmap(NULL, SECURE_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    
+    if (global_secure_memory_pointer == MAP_FAILED) {
+        perror("Ошибка выделения защищенной памяти (mmap)");
+        return 1;
+    }
+
+    // Запись распарсенного ключа напрямую в защищенную область
+    *(volatile char*)global_secure_memory_pointer = (char)std::atoi(argv[argc - 1]);
+    
+    // Установка защиты "Полная блокировка" (ни чтения, ни записи)
+    if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE) == -1) {
+        perror("Ошибка установки защиты памяти (mprotect PROT_NONE)");
+        return 1;
+    }
+
+    // --- БЛОК СИМУЛЯЦИИ АТАКИ ---
+#ifdef SIMULATE_ATTACK
+    std::cout << "\n[ATTACK] Симуляция атаки: попытка несанкционированной записи в защищенную память...\n";
+    *(volatile char*)global_secure_memory_pointer = 'X';
+#endif
+    // --- КОНЕЦ БЛОКА СИМУЛЯЦИИ АТАКИ ---
+    // --- БЛОК СИМУЛЯЦИИ ОБЫЧНОГО SEGFAULT ---
+    #ifdef SIMULATE_SEGFAULT
+        std::cout << "\n[SEGFAULT] Симуляция обычной ошибки: разыменование нулевого указателя...\n";
+        volatile char* bad_pointer = nullptr;
+        *bad_pointer = 'X'; // Спровоцирует обычный SIGSEGV (адрес 0x0)
+    #endif
+    // --- КОНЕЦ БЛОКА СИМУЛЯЦИИ ОБЫЧНОГО SEGFAULT ---
+    GlobalContext gctx(out_dir, input_files);
 
     bool is_auto = (mode == "auto");
     if (is_auto) {
@@ -280,6 +392,9 @@ int main(int argc, char* argv[]) {
 
         print_auto_comparison(mode, total_time, total_ticks, alt_mode, alt_time, alt_ticks);
     }
+
+    // Очистка при нормальном завершении программы
+    cleanup_secure_memory();
 
     std::cout << "\n[OK] Secure batch copy finished. Check log.txt and stat.txt." << std::endl;
     return 0;

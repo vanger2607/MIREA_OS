@@ -37,9 +37,18 @@ secure_copy: secure_copy.o libcaesar.so
 	$(CXX) $(CXXFLAGS) -o secure_copy secure_copy.o $(APP_LDFLAGS)
 
 # НОВАЯ ЦЕЛЬ: объектный файл программы. 
-# Зависит только от caesar.h (убрали удаленные readerwriterqueue.h и atomicops.h)
+# Зависит только от caesar.h
 secure_copy.o: secure_copy.cpp caesar.h
 	$(CXX) $(CXXFLAGS) -c secure_copy.cpp -o secure_copy.o
+
+# ЦЕЛЬ ДЛЯ ДЕМОНСТРАЦИИ АТАКИ: Собирает бинарник с условным макросом SIMULATE_ATTACK
+secure_copy_attack: secure_copy.cpp libcaesar.so
+	$(CXX) $(CXXFLAGS) -DSIMULATE_ATTACK -o secure_copy_attack secure_copy.cpp $(APP_LDFLAGS)
+
+# ЦЕЛЬ ДЛЯ ДЕМОНСТРАЦИИ ОБЫЧНОЙ ОШИБКИ: Собирает бинарник с макросом SIMULATE_SEGFAULT
+secure_copy_segfault: secure_copy.cpp libcaesar.so
+	$(CXX) $(CXXFLAGS) -DSIMULATE_SEGFAULT -o secure_copy_segfault secure_copy.cpp $(APP_LDFLAGS)
+
 
 # ----------------- УТИЛИТЫ -----------------
 
@@ -50,6 +59,34 @@ install: libcaesar.so
 # ldconfig обновляет кэш линкера, чтобы система "увидела" новую библиотеку
 
 # ----------------- ТЕСТЫ -----------------
+
+# ТЕСТ: Проверка защиты памяти (Имитация атаки с выводом логов)
+test_security: secure_copy_attack input.txt
+	@echo "\n=== Проверка защиты памяти (Ожидается SIGSEGV и перехват) ==="
+	@echo "--- НАЧАЛО ВЫВОДА ПРОГРАММЫ ---"
+	@./secure_copy_attack --mode=parallel input.txt output_dir 77 2>&1 | tee attack_out.log || true
+	@echo "--- КОНЕЦ ВЫВОДА ПРОГРАММЫ ---"
+	@if grep -q "SECURITY ERROR" attack_out.log; then \
+		echo "\n[УСПЕХ] Попытка взлома успешно перехвачена обработчиком!"; \
+	else \
+		echo "\n[ОШИБКА] Защита не сработала или получено неверное сообщение!"; exit 1; \
+	fi
+	@rm -f secure_copy_attack attack_out.log
+
+# ТЕСТ: Проверка различения ошибок (Обычный SEGFAULT)
+test_segfault: secure_copy_segfault input.txt
+	@echo "\n=== Проверка различения ошибок (Ожидается обычный SEGFAULT) ==="
+	@echo "--- НАЧАЛО ВЫВОДА ПРОГРАММЫ ---"
+	@./secure_copy_segfault --mode=parallel input.txt output_dir 77 2>&1 | tee segfault_out.log || true
+	@echo "--- КОНЕЦ ВЫВОДА ПРОГРАММЫ ---"
+	@if grep -q "SEGFAULT ERROR" segfault_out.log; then \
+		echo "\n[УСПЕХ] Обработчик верно распознал обычную ошибку памяти!"; \
+	else \
+		echo "\n[ОШИБКА] Обработчик не распознал ошибку или перепутал её с атакой!"; exit 1; \
+	fi
+	@rm -f secure_copy_segfault segfault_out.log
+
+
 
 # ТЕСТ: Проверка правильного падения при неверном флаге
 test_invalid_mode: all input.txt
@@ -106,13 +143,13 @@ cache_test: bench_seq bench_par bench_auto
 # ----------------- ОЧИСТКА -----------------
 
 clean:
-	rm -f *.o *.so secure_copy output.txt output_decrypted.txt input.txt file*.txt
+	rm -f *.o *.so secure_copy secure_copy_attack secure_copy_segfault output.txt output_decrypted.txt input.txt file*.txt
 	rm -rf output_dir output_decrypted_dir test_hash_in test_hash_out test_hash_dec
 	rm -rf input_test output_test decrypted_test
-	rm -f stat.txt log.txt hash_orig.txt hash_dec.txt
-# удаляем все промежуточные .o, библиотеку .so, бинарник программы и текстовые файлы.
+	rm -f stat.txt log.txt hash_orig.txt hash_dec.txt attack_out.log segfault_out.log
+# удаляем все промежуточные .o, библиотеку .so, бинарники программы и текстовые файлы.
 
-.PHONY: all install test test_2 test_invalid_mode test_hash gen_heavy bench_par bench_seq bench_auto cache_test clean # Говорим make, что эти цели - не файлы, а абстрактные действия
+.PHONY: all install test test_2 test_invalid_mode test_security test_segfault test_hash gen_heavy bench_par bench_seq bench_auto cache_test clean
 
 # Создаём тестовый файл для make test (если его нет)
 input.txt:

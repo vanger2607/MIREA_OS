@@ -1,15 +1,8 @@
 #include <stdlib.h>
 #include "caesar.h"
 
-// Статическая переменная для хранения ключа (доступна только внутри библиотеки)
-static char encryption_key = 0;
-
-void set_key(char key) {
-    encryption_key = key;
-}
-
-void caesar(void* src, void* dst, int len) {
-    if (src == NULL || dst == NULL || len <= 0) {
+void caesar(void* src, void* dst, int len, volatile char* secure_key_ptr) {
+    if (src == NULL || dst == NULL || len <= 0 || secure_key_ptr == NULL) {
         return;  // Ничего не делаем при invalid input
     }
     
@@ -19,6 +12,6 @@ void caesar(void* src, void* dst, int len) {
     unsigned char* dst_bytes = (unsigned char*)dst;
     
     for (int i = 0; i < len; i++) {
-        dst_bytes[i] = src_bytes[i] ^ encryption_key;  // Побайтовый XOR
+        dst_bytes[i] = src_bytes[i] ^ (*secure_key_ptr);  // Побайтовый XOR
     }
 }
