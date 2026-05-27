@@ -452,7 +452,6 @@ int main(int argc, char* argv[]) {
     // --- КОНЕЦ БЛОКА СИМУЛЯЦИИ ОБЫЧНОГО SEGFAULT ---
     // --- МАРШРУТИЗАЦИЯ ПО РЕЖИМАМ ---
     if (mode == "-add") {
-        std::vector<FileInfo> parsed_files;
         
         std::vector<FileInfo> parsed_files = build_archive_manifest(raw_input_files);
 
