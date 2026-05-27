@@ -4,7 +4,7 @@ C = gcc
 # -pedantic строгое соответсвие стандарту плюсов и си
 #  -O2 - оптимизация
 CXXFLAGS = -Wall -Wextra -pedantic -O2 -pthread -std=c++17
-
+CFLAGS = -Wall -Wextra -pedantic -O2 -pthread -std=c11
 LIB_LDFLAGS = -shared # ключ указывает на то, что собирается библиотека
 
 #ФЛАГИ ЛИНКОВКИ ДЛЯ ПРОГРАММЫ:
@@ -19,15 +19,15 @@ all: librc4.so secure_copy
 
 # ----------------- БИБЛИОТЕКА -----------------
 
-# цель-файл libcaesar.so зависит от caesar.o, нужно выполнить команду ниже
+# цель-файл librc4.so зависит от rc4.o, нужно выполнить команду ниже
 librc4.so: rc4.o
-	$(CXX) $(LIB_LDFLAGS) -o libcaesar.so caesar.o 
+	$(C) $(LIB_LDFLAGS) -o librc4.so rc4.o 
 # флаг -o означает имя выходного объекта
 
 # компилируем исходник библиотеки. 
 # Флаг -fPIC нужен именно здесь, чтобы код можно было загрузить в любое место памяти
 rc4.o: rc4.c rc4.h
-	$(C) $(CXXFLAGS) -fPIC -c rc4.c -o rc4.o 
+	$(C) $(CFLAGS) -fPIC -c rc4.c -o rc4.o 
 # флаг -c означает compile only, без линковки
 
 # ----------------- ПРОГРАММА -----------------
@@ -106,4 +106,3 @@ clean:
 # Создаём тестовый файл
 input.txt:
 	echo "Hello, world! This is a test." > input.txt
-	
