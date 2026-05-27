@@ -705,6 +705,9 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[WARNING] Пропуск дубликата (уже есть в архиве): " << file.archive_name << "\n";
             } else {
                 unique_files.push_back(file);
+                // Запоминаем файл, чтобы отловить дубликаты 
+                // внутри одной и той же команды (например, переданные дважды)
+                existing_files.insert(file.archive_name);
             }
         }
         

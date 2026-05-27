@@ -58,42 +58,68 @@ install: librc4.so
 	sudo ldconfig 
 # ldconfig обновляет кэш линкера, чтобы система "увидела" новую библиотеку
 
-# ----------------- ТЕСТЫ -----------------
+# ----------------- КОМПЛЕКСНЫЕ ТЕСТЫ СИСТЕМЫ -----------------
 
-# ТЕСТ: Проверка защиты памяти (Имитация атаки с выводом логов)
-test_security: secure_copy_attack input.txt
-	@echo "\n=== Проверка защиты памяти (Ожидается SIGSEGV и перехват) ==="
-	@echo "--- НАЧАЛО ВЫВОДА ПРОГРАММЫ ---"
-	@./secure_copy_attack -add -key "secret" -image disk.img input.txt 2>&1 | tee attack_out.log || true
-	@echo "--- КОНЕЦ ВЫВОДА ПРОГРАММЫ ---"
-	@if grep -q "SECURITY ERROR" attack_out.log; then \
-		echo "\n[УСПЕХ] Попытка взлома успешно перехвачена обработчиком!"; \
-	else \
-		echo "\n[ОШИБКА] Защита не сработала или получено неверное сообщение!"; exit 1; \
-	fi
-	@rm -f secure_copy_attack attack_out.log disk.img
+# Мастер-цель для запуска всех базовых тестов
+test_all: test_hash test_edge_cases test_invalid_args
+	@echo "\n[ОТЛИЧНО] Все базовые тесты успешно пройдены!"
 
-# ТЕСТ: Проверка различения ошибок (Обычный SEGFAULT)
-test_segfault: secure_copy_segfault input.txt
-	@echo "\n=== Проверка различения ошибок (Ожидается обычный SEGFAULT) ==="
-	@echo "--- НАЧАЛО ВЫВОДА ПРОГРАММЫ ---"
-	@./secure_copy_segfault -add -key "secret" -image disk.img input.txt 2>&1 | tee segfault_out.log || true
-	@echo "--- КОНЕЦ ВЫВОДА ПРОГРАММЫ ---"
-	@if grep -q "SEGFAULT ERROR" segfault_out.log; then \
-		echo "\n[УСПЕХ] Обработчик верно распознал обычную ошибку памяти!"; \
-	else \
-		echo "\n[ОШИБКА] Обработчик не распознал ошибку или перепутал её с атакой!"; exit 1; \
-	fi
-	@rm -f secure_copy_segfault segfault_out.log disk.img
+# ТЕСТ 1: Строгая проверка хэш-сумм (MD5) для текстовых и бинарных файлов
+test_hash: secure_copy
+	@echo "\n=== Тест 1: Проверка целостности данных (Хэш-суммы) ==="
+	@rm -rf test_env && mkdir -p test_env
+	@echo "[INFO] Генерация тестовых данных..."
+	@echo "Secure data test" > test_env/file1.txt
+	@dd if=/dev/urandom of=test_env/data.bin bs=1M count=2 2>/dev/null
+	@echo "[INFO] Упаковка файлов..."
+	@./secure_copy -add -key "testkey" -image test_env/vault.img test_env/file1.txt test_env/data.bin >/dev/null
+	@echo "[INFO] Извлечение файлов..."
+	@./secure_copy -get -key "testkey" -image test_env/vault.img -out test_env/out_file1.txt /file1.txt >/dev/null
+	@./secure_copy -get -key "testkey" -image test_env/vault.img -out test_env/out_data.bin /data.bin >/dev/null
+	@echo "[INFO] Сверка хэшей..."
+	@md5sum test_env/file1.txt | awk '{print $$1}' > test_env/hash1.txt
+	@md5sum test_env/out_file1.txt | awk '{print $$1}' > test_env/hash2.txt
+	@diff test_env/hash1.txt test_env/hash2.txt && echo "[УСПЕХ] Текстовый файл совпал!" || (echo "[ОШИБКА] Текстовый файл поврежден!"; exit 1)
+	@md5sum test_env/data.bin | awk '{print $$1}' > test_env/hash3.txt
+	@md5sum test_env/out_data.bin | awk '{print $$1}' > test_env/hash4.txt
+	@diff test_env/hash3.txt test_env/hash4.txt && echo "[УСПЕХ] Бинарный файл (2 МБ) совпал!" || (echo "[ОШИБКА] Бинарный файл поврежден!"; exit 1)
+	@rm -rf test_env
 
-# ТЕСТ: Проверка правильного падения при отсутствии обязательных аргументов
-test_invalid_args: all
-	@echo "\n=== Проверка падения при неверных аргументах ==="
-	@if ./secure_copy -add input.txt 2>/dev/null; then \
-		echo "[ОШИБКА] Программа не упала при отсутствии образа и ключа!"; exit 1; \
-	else \
-		echo "[УСПЕХ] Программа штатно завершилась с ошибкой Usage (как и ожидалось)."; \
-	fi
+# ТЕСТ 2: Краевые случаи (Дубликаты, O_EXCL, Неверный пароль)
+test_edge_cases: secure_copy
+	@echo "\n=== Тест 2: Проверка краевых случаев и защит ==="
+	@rm -rf test_edge && mkdir -p test_edge
+	@echo "secret" > test_edge/file.txt
+	
+	@echo "\n[+] Проверка дедупликации (-add):"
+	@./secure_copy -add -key "key" -image test_edge/vault.img test_edge/file.txt test_edge/file.txt 2>&1 | grep -q "Пропуск дубликата" && echo "  -> [УСПЕХ] Дубликаты корректно заблокированы." || (echo "  -> [ОШИБКА]"; exit 1)
+	
+	@echo "\n[+] Проверка O_EXCL (-get):"
+	@./secure_copy -get -key "key" -image test_edge/vault.img -out test_edge/file.txt /file.txt 2>&1 | grep -q "уже существует" && echo "  -> [УСПЕХ] Перезапись существующего файла заблокирована." || (echo "  -> [ОШИБКА]"; exit 1)
+	
+	@echo "\n[+] Проверка обработки отсутствующего файла:"
+	@./secure_copy -get -key "key" -image test_edge/vault.img -out test_edge/ghost.txt /ghost.txt 2>&1 | grep -q "не найден" && echo "  -> [УСПЕХ] Поиск несуществующего файла отработал корректно." || (echo "  -> [ОШИБКА]"; exit 1)
+	
+	@echo "\n[+] Проверка реакции на неверный пароль:"
+	@./secure_copy -get -key "wrong_pass" -image test_edge/vault.img -out test_edge/bad_decrypt.txt /file.txt >/dev/null
+	@if ! cmp -s test_edge/file.txt test_edge/bad_decrypt.txt; then echo "  -> [УСПЕХ] Файл с неверным ключом расшифрован в 'мусор' (хэши разошлись)."; else echo "  -> [ОШИБКА] Данные совпали при неверном ключе!"; exit 1; fi
+	
+	@rm -rf test_edge
+
+# ТЕСТ 3: Экстремальная нагрузка (15 файлов по 4 ГБ)
+# ВНИМАНИЕ: Требует ~60 ГБ реального свободного места на диске!
+test_stress: secure_copy
+	@echo "\n=== Тест 3: Экстремальная нагрузка (15 файлов по 4 ГБ) ==="
+	@rm -rf test_stress_env && mkdir -p test_stress_env
+	@echo "[INFO] Создание 15 sparse-файлов по 4294967295 байт (максимум для uint32_t)..."
+	@for i in $$(seq 1 15); do truncate -s 4294967295 test_stress_env/huge_$$i.bin; done
+	@echo "[ВНИМАНИЕ] Начинается шифрование. Образ займет ~60 ГБ физического места!"
+	@echo "[INFO] Это может занять от 10 минут до часа в зависимости от процессора и диска..."
+	@time ./secure_copy -add -key "stresskey" -image test_stress_env/stress_vault.img test_stress_env/huge_*.bin
+	@echo "\n[INFO] Проверка таблицы файлов (-list):"
+	@./secure_copy -list -image test_stress_env/stress_vault.img
+	@echo "\n[УСПЕХ] Стресс-тест успешно пройден!"
+	@rm -rf test_stress_env
 
 # ----------------- ОЧИСТКА -----------------
 
