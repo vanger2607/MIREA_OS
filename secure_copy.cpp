@@ -35,7 +35,7 @@ volatile sig_atomic_t keep_running = 1;
 
 // Глобальные переменные для защищенной памяти
 void* global_secure_memory_pointer = nullptr; 
-const size_t SECURE_MEMORY_SIZE = 16;
+const size_t SECURE_MEMORY_SIZE = 257;
 
 /*
  Функция для окончательного уничтожения данных в памяти.
@@ -462,7 +462,7 @@ int main(int argc, char* argv[]) {
         }
 
         // 2. Открываем образ контейнера (0600 - доступ ТОЛЬКО владельцу)
-        int fd = open(image_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+        int fd = open(image_file.c_str(), O_WRONLY | O_CREAT, 0600);
         if (fd < 0) {
             perror("Ошибка открытия образа");
             cleanup_secure_memory();
