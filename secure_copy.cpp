@@ -290,35 +290,60 @@ std::vector<FileInfo> build_archive_manifest(const std::vector<std::string>& raw
     std::vector<FileInfo> manifest;
     
     for (const std::string& input_path : raw_paths) {
-        fs::path p(input_path);
+        // 1. Очищаем путь от случайного слэша на конце
+        std::string clean_path = input_path;
+        if (!clean_path.empty() && (clean_path.back() == '/' || clean_path.back() == '\\')) {
+            clean_path.pop_back();
+        }
         
-        if (fs::is_regular_file(p)) {
-            // Если передан одиночный файл, берем только его базовое имя (без пути).
-            // Пример: "/home/user/file.txt" -> "file.txt"
-            manifest.push_back({p.filename().string(), p.string()});
+        fs::path p(clean_path);
+        std::error_code ec; // Объект для безопасного перехвата ошибок ФС
+        
+        // 2. Базовая проверка существования
+        if (!fs::exists(p, ec)) {
+            std::cerr << "[WARNING] Путь не существует или недоступен: " << input_path << "\n";
+            continue;
+        }
+
+        if (fs::is_regular_file(p, ec)) {
+            // Проверка прав на чтение (POSIX)
+            if (access(p.c_str(), R_OK) != 0) {
+                std::cerr << "[WARNING] Нет прав на чтение файла: " << input_path << "\n";
+                continue;
+            }
+            
+            std::string archive_name = "/" + p.relative_path().generic_string();
+            manifest.push_back({archive_name, p.string()});
         } 
-        else if (fs::is_directory(p)) {
-            // Если передана директория, запускаем рекурсивный итератор по всем вложенным папкам
-            for (const auto& entry : fs::recursive_directory_iterator(p)) {
-                if (fs::is_regular_file(entry)) {
-                    // Вычисляем путь файла относительно родительской папки исходного аргумента.
-                    // Это гарантирует, что если мы передали папку "in/", 
-                    // файл внутри нее получит правильное имя "in/dir/file.txt",
-                    // что соответствует требованию сохранения абсолютного пути в рамках директории.
-                    std::string rel_path = fs::relative(entry.path(), p.parent_path()).string();
-                    manifest.push_back({rel_path, entry.path().string()});
+        else if (fs::is_directory(p, ec)) {
+            // Запускаем безопасный итератор, который сам игнорирует запретные папки
+            auto options = fs::directory_options::skip_permission_denied;
+            
+            for (const auto& entry : fs::recursive_directory_iterator(p, options)) {
+                std::error_code entry_ec;
+                
+                // Пропускаем символические ссылки, сокеты, пайпы и устройства (/dev/*)
+                if (fs::is_regular_file(entry, entry_ec)) {
+                    
+                    // Проверка прав на чтение конкретного вложенного файла
+                    if (access(entry.path().c_str(), R_OK) != 0) {
+                        std::cerr << "[WARNING] Нет прав на чтение файла: " << entry.path().string() << "\n";
+                        continue;
+                    }
+                    
+                    std::string archive_name = "/" + entry.path().relative_path().generic_string();
+                    manifest.push_back({archive_name, entry.path().string()});
                 }
             }
         } 
         else {
-            std::cerr << "[WARNING] Игнорируется неизвестный тип пути (не файл и не директория): " 
-                      << input_path << "\n";
+            // Сюда попадут сокеты, именованные каналы (FIFO) и блочные/символьные устройства
+            std::cerr << "[WARNING] Игнорируется специальный или системный файл: " << input_path << "\n";
         }
     }
     
     return manifest;
 }
-
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
