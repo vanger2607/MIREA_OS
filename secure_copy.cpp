@@ -15,7 +15,6 @@
 #include <sys/stat.h>
 #include <cstring> 
 #include <time.h> // Для clock_gettime
-#include <x86intrin.h>
 
 #include <sys/mman.h>  // Для хранения ключа и безопасного выделения памяти
 #include <signal.h>
@@ -198,68 +197,6 @@ void* worker_func(void* arg) {
     return nullptr;
 }
 
-void print_stats(const std::string& mode, double total_time, unsigned long long total_ticks, size_t file_count) {
-    double avg = (file_count > 0) ? total_time / file_count : 0.0;
-    unsigned long long avg_ticks = (file_count > 0) ? total_ticks / file_count : 0;
-    
-    std::stringstream ss;
-    ss << "\n=== Statistics (" << mode << ") ===\n"
-       << "Files processed: " << file_count << "\n"
-       << "Total time: " << total_time << " ms\n"
-       << "Total ticks: " << total_ticks << "\n"
-       << "Average time per file: " << avg << " ms\n"
-       << "Average ticks per file: " << avg_ticks << "\n"
-       << "===========================\n";
-
-    std::cout << ss.str();
-    std::ofstream stat_file("stat.txt", std::ios::app);
-    if (stat_file.is_open()) {
-        stat_file << ss.str();
-    }
-}
-
-void print_auto_comparison(const std::string& mode, double total_time, unsigned long long total_ticks, 
-                           const std::string& alt_mode, double alt_time, unsigned long long alt_ticks) {
-    double parallel_time = (mode == "parallel") ? total_time : alt_time;
-    double seq_time = (mode == "sequential") ? total_time : alt_time;
-    
-    unsigned long long parallel_ticks = (mode == "parallel") ? total_ticks : alt_ticks;
-    unsigned long long seq_ticks = (mode == "sequential") ? total_ticks : alt_ticks;
-    
-    std::string time_comparison_result;
-    if (parallel_time < seq_time) {
-        time_comparison_result = "Parallel mode is faster by " + std::to_string(seq_time - parallel_time) + " ms.";
-    } else {
-        time_comparison_result = "Sequential mode is faster by " + std::to_string(parallel_time - seq_time) + " ms.";
-    }
-
-    std::string tick_comparison_result;
-    if (parallel_ticks < seq_ticks) {
-        tick_comparison_result = "Parallel mode took fewer ticks by " + std::to_string(seq_ticks - parallel_ticks) + " ticks.";
-    } else {
-        tick_comparison_result = "Sequential mode took fewer ticks by " + std::to_string(parallel_ticks - seq_ticks) + " ticks.";
-    }
-
-    std::stringstream ss;
-    ss << "\n[Auto Mode Comparison Table]\n"
-       << std::left << std::setw(15) << "Mode" 
-       << std::setw(20) << "Total Time (ms)" 
-       << std::setw(20) << "Total Ticks\n"
-       << "------------------------------------------------------\n"
-       << std::left << std::setw(15) << mode << std::setw(20) << total_time << total_ticks << "\n"
-       << std::left << std::setw(15) << alt_mode << std::setw(20) << alt_time << alt_ticks << "\n"
-       << "------------------------------------------------------\n"
-       << time_comparison_result << "\n"
-       << tick_comparison_result << "\n";
-       
-    std::cout << ss.str();
-    
-    std::ofstream stat_file("stat.txt", std::ios::app);
-    if (stat_file.is_open()) {
-        stat_file << ss.str();
-    }
-}
-
 int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
     
@@ -274,21 +211,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string mode = "auto";
     int start_idx = 1;
 
-    // Парсим режим
-    if (argc > 1 && strncmp(argv[1], "--mode=", 7) == 0) {
-        mode = argv[1] + 7;
-        start_idx = 2;
-        if (mode != "sequential" && mode != "parallel") {
-            std::cerr << "Error: Invalid mode. Введите верное значение режима (--mode=sequential или --mode=parallel)\n";
-            return 1;
-        }
-    }
-
     if (argc - start_idx < 3) {
-        std::cerr << "Usage: " << argv[0] << " [--mode=sequential|parallel] <file1.txt> [file2.txt ...] <out_dir> <key_number>\n";
+        std::cerr << "Usage: " << "New Usage will be here later";
         return 1;
     }
 
@@ -332,21 +258,9 @@ int main(int argc, char* argv[]) {
     // --- КОНЕЦ БЛОКА СИМУЛЯЦИИ ОБЫЧНОГО SEGFAULT ---
     GlobalContext gctx(out_dir, input_files);
 
-    bool is_auto = (mode == "auto");
-    if (is_auto) {
-        mode = (input_files.size() < 5) ? "sequential" : "parallel";
-    }
 
-    int num_threads = (mode == "parallel") ? MAX_COUNT : 1;
+    int num_threads = MAX_COUNT;
 
-    // --- Запускаем таймер для основного прогона ---
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    unsigned long long start_ticks = __rdtsc();
-
-    if (num_threads == 1) {
-        worker_func(&gctx); // Без накладных расходов pthread
-    } else {
         pthread_t workers[MAX_COUNT];
         for (int i = 0; i < num_threads; ++i) {
             pthread_create(&workers[i], nullptr, worker_func, &gctx);
@@ -354,45 +268,6 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < num_threads; ++i) {
             pthread_join(workers[i], nullptr);
         }
-    }
-
-    // --- Останавливаем таймер и выводим статистику ---
-    unsigned long long end_ticks = __rdtsc();
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    
-    double total_time = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
-    unsigned long long total_ticks = end_ticks - start_ticks;
-    print_stats(mode, total_time, total_ticks, input_files.size());
-
-    // --- Блок для автоматического сравнения ---
-    if (is_auto && keep_running) {
-        gctx.file_idx = 0; // Сбрасываем очередь файлов
-        std::string alt_mode = (mode == "parallel") ? "sequential" : "parallel";
-        int alt_threads = (alt_mode == "parallel") ? MAX_COUNT : 1;
-
-        struct timespec alt_start, alt_end;
-        clock_gettime(CLOCK_MONOTONIC, &alt_start);
-        unsigned long long alt_start_ticks = __rdtsc();
-
-        if (alt_threads == 1) {
-            worker_func(&gctx);
-        } else {
-            pthread_t workers[MAX_COUNT];
-            for (int i = 0; i < alt_threads; ++i) {
-                pthread_create(&workers[i], nullptr, worker_func, &gctx);
-            }
-            for (int i = 0; i < alt_threads; ++i) {
-                pthread_join(workers[i], nullptr);
-            }
-        }
-        unsigned long long alt_end_ticks = __rdtsc();
-        clock_gettime(CLOCK_MONOTONIC, &alt_end);
-        double alt_time = (alt_end.tv_sec - alt_start.tv_sec) * 1000.0 + (alt_end.tv_nsec - alt_start.tv_nsec) / 1000000.0;
-        unsigned long long alt_ticks = alt_end_ticks - alt_start_ticks;
-
-        print_auto_comparison(mode, total_time, total_ticks, alt_mode, alt_time, alt_ticks);
-    }
-
     // Очистка при нормальном завершении программы
     cleanup_secure_memory();
 
