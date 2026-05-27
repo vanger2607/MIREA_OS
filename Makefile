@@ -3,7 +3,7 @@ C = gcc
 #-pthread (обязательный флаг для работы со std::atomic и POSIX-потоками)
 # -pedantic строгое соответсвие стандарту плюсов и си
 #  -O2 - оптимизация
-CXXFLAGS = -Wall -Wextra -pedantic -O2 -pthread 
+CXXFLAGS = -Wall -Wextra -pedantic -O2 -pthread -std=c++17
 
 LIB_LDFLAGS = -shared # ключ указывает на то, что собирается библиотека
 
@@ -12,48 +12,48 @@ LIB_LDFLAGS = -shared # ключ указывает на то, что собир
 # -lcaesar заставляет прилинковать файл libcaesar.so (префикс lib и .so опускаются)
 # -Wl,-rpath,. вшивает путь к библиотеке прямо в бинарник, чтобы программа 
 # могла найти .so файл в текущей папке без необходимости делать make install
-APP_LDFLAGS = -L. -lcaesar -Wl,-rpath,.
+APP_LDFLAGS = -L. -lrc4 -Wl,-rpath,.
 
 # задаём цель all: теперь она собирает и библиотеку, и саму программу
-all: libcaesar.so secure_copy
+all: librc4.so secure_copy
 
 # ----------------- БИБЛИОТЕКА -----------------
 
 # цель-файл libcaesar.so зависит от caesar.o, нужно выполнить команду ниже
-libcaesar.so: caesar.o
+librc4.so: rc4.o
 	$(CXX) $(LIB_LDFLAGS) -o libcaesar.so caesar.o 
 # флаг -o означает имя выходного объекта
 
 # компилируем исходник библиотеки. 
 # Флаг -fPIC нужен именно здесь, чтобы код можно было загрузить в любое место памяти
-caesar.o: caesar.c caesar.h
-	$(C) $(CXXFLAGS) -fPIC -c caesar.c -o caesar.o 
+rc4.o: rc4.c rc4.h
+	$(C) $(CXXFLAGS) -fPIC -c rc4.c -o rc4.o 
 # флаг -c означает compile only, без линковки
 
 # ----------------- ПРОГРАММА -----------------
 
 # НОВАЯ ЦЕЛЬ: собираем исполняемый файл. Он зависит от своего .o файла и от библиотеки
-secure_copy: secure_copy.o libcaesar.so
+secure_copy: secure_copy.o librc4.so
 	$(CXX) $(CXXFLAGS) -o secure_copy secure_copy.o $(APP_LDFLAGS)
 
 # НОВАЯ ЦЕЛЬ: объектный файл программы. 
-# Зависит только от caesar.h
-secure_copy.o: secure_copy.cpp caesar.h
+# Зависит только от rc4.h
+secure_copy.o: secure_copy.cpp rc4.h
 	$(CXX) $(CXXFLAGS) -c secure_copy.cpp -o secure_copy.o
 
 # ЦЕЛЬ ДЛЯ ДЕМОНСТРАЦИИ АТАКИ: Собирает бинарник с условным макросом SIMULATE_ATTACK
-secure_copy_attack: secure_copy.cpp libcaesar.so
+secure_copy_attack: secure_copy.cpp librc4.so
 	$(CXX) $(CXXFLAGS) -DSIMULATE_ATTACK -o secure_copy_attack secure_copy.cpp $(APP_LDFLAGS)
 
 # ЦЕЛЬ ДЛЯ ДЕМОНСТРАЦИИ ОБЫЧНОЙ ОШИБКИ: Собирает бинарник с макросом SIMULATE_SEGFAULT
-secure_copy_segfault: secure_copy.cpp libcaesar.so
+secure_copy_segfault: secure_copy.cpp librc4.so
 	$(CXX) $(CXXFLAGS) -DSIMULATE_SEGFAULT -o secure_copy_segfault secure_copy.cpp $(APP_LDFLAGS)
 
 
 # ----------------- УТИЛИТЫ -----------------
 
-install: libcaesar.so
-	sudo cp libcaesar.so /usr/local/lib/ 
+install: librc4.so
+	sudo cp librc4.so /usr/local/lib/ 
 # cp копирует файл библиотеки в системную директорию, чтобы библиотека стала доступна глобально
 	sudo ldconfig 
 # ldconfig обновляет кэш линкера, чтобы система "увидела" новую библиотеку
@@ -64,93 +64,46 @@ install: libcaesar.so
 test_security: secure_copy_attack input.txt
 	@echo "\n=== Проверка защиты памяти (Ожидается SIGSEGV и перехват) ==="
 	@echo "--- НАЧАЛО ВЫВОДА ПРОГРАММЫ ---"
-	@./secure_copy_attack --mode=parallel input.txt output_dir 77 2>&1 | tee attack_out.log || true
+	@./secure_copy_attack -add -key "secret" -image disk.img input.txt 2>&1 | tee attack_out.log || true
 	@echo "--- КОНЕЦ ВЫВОДА ПРОГРАММЫ ---"
 	@if grep -q "SECURITY ERROR" attack_out.log; then \
 		echo "\n[УСПЕХ] Попытка взлома успешно перехвачена обработчиком!"; \
 	else \
 		echo "\n[ОШИБКА] Защита не сработала или получено неверное сообщение!"; exit 1; \
 	fi
-	@rm -f secure_copy_attack attack_out.log
+	@rm -f secure_copy_attack attack_out.log disk.img
 
 # ТЕСТ: Проверка различения ошибок (Обычный SEGFAULT)
 test_segfault: secure_copy_segfault input.txt
 	@echo "\n=== Проверка различения ошибок (Ожидается обычный SEGFAULT) ==="
 	@echo "--- НАЧАЛО ВЫВОДА ПРОГРАММЫ ---"
-	@./secure_copy_segfault --mode=parallel input.txt output_dir 77 2>&1 | tee segfault_out.log || true
+	@./secure_copy_segfault -add -key "secret" -image disk.img input.txt 2>&1 | tee segfault_out.log || true
 	@echo "--- КОНЕЦ ВЫВОДА ПРОГРАММЫ ---"
 	@if grep -q "SEGFAULT ERROR" segfault_out.log; then \
 		echo "\n[УСПЕХ] Обработчик верно распознал обычную ошибку памяти!"; \
 	else \
 		echo "\n[ОШИБКА] Обработчик не распознал ошибку или перепутал её с атакой!"; exit 1; \
 	fi
-	@rm -f secure_copy_segfault segfault_out.log
+	@rm -f secure_copy_segfault segfault_out.log disk.img
 
-
-
-# ТЕСТ: Проверка правильного падения при неверном флаге
-test_invalid_mode: all input.txt
-	@echo "\n=== Проверка падения при неверном флаге ==="
-	@if ./secure_copy --mode=wrong_mode input.txt output_dir 77 2>/dev/null; then \
-		echo "[ОШИБКА] Программа не упала при неверном флаге!"; exit 1; \
+# ТЕСТ: Проверка правильного падения при отсутствии обязательных аргументов
+test_invalid_args: all
+	@echo "\n=== Проверка падения при неверных аргументах ==="
+	@if ./secure_copy -add input.txt 2>/dev/null; then \
+		echo "[ОШИБКА] Программа не упала при отсутствии образа и ключа!"; exit 1; \
 	else \
-		echo "[УСПЕХ] Программа штатно завершилась с ошибкой (как и ожидалось)."; \
+		echo "[УСПЕХ] Программа штатно завершилась с ошибкой Usage (как и ожидалось)."; \
 	fi
-
-# ТЕСТ: Проверка хеша
-test_hash: all gen_heavy
-	@echo "\n=== Проверка целостности данных (MD5 Hash) ==="
-	@mkdir -p test_hash_out test_hash_dec
-	@echo "[1/2] Шифруем heavy_1.bin..."
-	@./secure_copy --mode=sequential input_test/heavy_1.bin test_hash_out 77 > /dev/null
-	@echo "[2/2] Дешифруем heavy_1.bin обратно..."
-	@./secure_copy --mode=sequential test_hash_out/heavy_1.bin test_hash_dec 77 > /dev/null
-	@md5sum input_test/heavy_1.bin | awk '{print $$1}' > hash_orig.txt
-	@md5sum test_hash_dec/heavy_1.bin | awk '{print $$1}' > hash_dec.txt
-	@if diff -q hash_orig.txt hash_dec.txt > /dev/null; then \
-		echo "[УСПЕХ] Хеши полностью совпадают!"; \
-	else \
-		echo "[ОШИБКА] Хеши различаются!"; \
-	fi
-	@rm -f hash_orig.txt hash_dec.txt
-
-gen_heavy:
-	@mkdir -p input_test output_test
-	@if [ ! -f input_test/heavy_1.bin ]; then \
-		echo "\n=== Генерация тяжелых файлов (8x50MB) ==="; \
-		for i in 1 2 3 4 5 6 7 8; do \
-			dd if=/dev/urandom of=input_test/heavy_$$i.bin bs=1M count=50 2>/dev/null; \
-		done; \
-	fi
-
-bench_par: all gen_heavy
-	@echo "\n=== Запуск ПАРАЛЛЕЛЬНОГО режима ==="
-	sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
-	./secure_copy --mode=parallel input_test/heavy_*.bin output_test 5
-
-bench_seq: all gen_heavy
-	@echo "\n=== Запуск ПОСЛЕДОВАТЕЛЬНОГО режима ==="
-	sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
-	./secure_copy --mode=sequential input_test/heavy_*.bin output_test 5
-
-bench_auto: all gen_heavy
-	@echo "\n=== Запуск AUTO режима ==="
-	sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
-	./secure_copy input_test/heavy_*.bin output_test 5
-
-cache_test: bench_seq bench_par bench_auto
 
 # ----------------- ОЧИСТКА -----------------
 
 clean:
-	rm -f *.o *.so secure_copy secure_copy_attack secure_copy_segfault output.txt output_decrypted.txt input.txt file*.txt
-	rm -rf output_dir output_decrypted_dir test_hash_in test_hash_out test_hash_dec
-	rm -rf input_test output_test decrypted_test
-	rm -f stat.txt log.txt hash_orig.txt hash_dec.txt attack_out.log segfault_out.log
-# удаляем все промежуточные .o, библиотеку .so, бинарники программы и текстовые файлы.
+	rm -f *.o *.so secure_copy secure_copy_attack secure_copy_segfault input.txt disk.img
+	rm -f stat.txt log.txt attack_out.log segfault_out.log
 
-.PHONY: all install test test_2 test_invalid_mode test_security test_segfault test_hash gen_heavy bench_par bench_seq bench_auto cache_test clean
+.PHONY: all install test_invalid_args test_security test_segfault clean
 
-# Создаём тестовый файл для make test (если его нет)
+# Создаём тестовый файл
 input.txt:
-	echo "Hello, world! This is a test for ..." > input.txt
+	echo "Hello, world! This is a test." > input.txt
+	
