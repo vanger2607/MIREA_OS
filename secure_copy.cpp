@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <cstring> 
 #include <time.h> // Для clock_gettime
+#include <getopt.h>
 
 #include <sys/mman.h>  // Для хранения ключа и безопасного выделения памяти
 #include <signal.h>
@@ -210,22 +211,60 @@ int main(int argc, char* argv[]) {
         cleanup_secure_memory();
         return 1;
     }
-
-    int start_idx = 1;
-
-    if (argc - start_idx < 3) {
-        std::cerr << "Usage: " << "New Usage will be here later";
-        return 1;
-    }
-
-    std::string out_dir = argv[argc - 2];
-    mkdir(out_dir.c_str(), 0777);
+    std::string mode = "";
+    std::string key_str = "";
+    std::string image_file = "";
+    std::string out_file = "";
+    std::string target_file = "";
     std::vector<std::string> input_files;
 
-    for (int i = start_idx; i < argc - 2; ++i) {
+    struct option long_options[] = {
+        {"add",   no_argument,       0, 'a'},
+        {"list",  no_argument,       0, 'l'},
+        {"get",   no_argument,       0, 'g'},
+        {"key",   required_argument, 0, 'k'},
+        {"image", required_argument, 0, 'i'},
+        {"out",   required_argument, 0, 'o'},
+        {0, 0, 0, 0}
+    };
+    int opt;
+    int option_index = 0;
+    
+    // Парсинг флагов
+    while ((opt = getopt_long_only(argc, argv, "", long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 'a': mode = "-add"; break;
+            case 'l': mode = "-list"; break;
+            case 'g': mode = "-get"; break;
+            case 'k': key_str = optarg; break; // optarg - это встроенная переменная, содержащая значение аргумента
+            case 'i': image_file = optarg; break;
+            case 'o': out_file = optarg; break;
+            case '?': 
+                // getopt_long_only сама выведет ошибку, если флаг неизвестен или пропущен аргумент
+                return 1;
+        }
+    }
+
+    // Сбор свободных аргументов (позиционных), которые идут без флагов (file1.txt, dir/ и т.д.)
+    // После работы getopt_long_only, индекс optind указывает на первый свободный аргумент
+    for (int i = optind; i < argc; ++i) {
         input_files.push_back(argv[i]);
     }
 
+    // Валидация обязательных параметров
+    bool valid = true;
+    if (mode.empty() || image_file.empty()) valid = false;
+    if (mode == "-add" && (key_str.empty() || input_files.empty())) valid = false;
+    if (mode == "-get" && (key_str.empty() || input_files.empty() || out_file.empty())) valid = false;
+    if (mode == "-list" && !key_str.empty()) valid = false; // Для list ключ не нужен
+
+    if (!valid) {
+        std::cerr << "Usage:\n"
+                  << "  " << argv[0] << " -add -key <secret> -image <disk.img> <file1.txt> [file2.txt...] [dir/]\n"
+                  << "  " << argv[0] << " -list -image <disk.img>\n"
+                  << "  " << argv[0] << " -get -key <secret> -image <disk.img> -out <result_file> <file_name>\n";
+        return 1;
+    }
     // Выделение защищенной памяти
     global_secure_memory_pointer = mmap(NULL, SECURE_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     
@@ -233,10 +272,18 @@ int main(int argc, char* argv[]) {
         perror("Ошибка выделения защищенной памяти (mmap)");
         return 1;
     }
-
-    // Запись распарсенного ключа напрямую в защищенную область
-    *(volatile char*)global_secure_memory_pointer = (char)std::atoi(argv[argc - 1]);
-    
+    if (!key_str.empty()) {
+        size_t max_len = SECURE_MEMORY_SIZE - 1;
+        
+        if (key_str.length() > max_len) {
+            std::cerr << "[WARNING] Введенный ключ слишком длинный (" << key_str.length() 
+                      << " байт). Он будет обрезан до " << max_len << " байт для обеспечения безопасности памяти.\n";
+        }
+        
+        size_t copy_len = std::min(key_str.length(), max_len);
+        std::memcpy(global_secure_memory_pointer, key_str.c_str(), copy_len);
+        ((char*)global_secure_memory_pointer)[copy_len] = '\0';
+    }
     // Установка защиты "Полная блокировка" (ни чтения, ни записи)
     if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE) == -1) {
         perror("Ошибка установки защиты памяти (mprotect PROT_NONE)");
@@ -256,7 +303,7 @@ int main(int argc, char* argv[]) {
         *bad_pointer = 'X'; // Спровоцирует обычный SIGSEGV (адрес 0x0)
     #endif
     // --- КОНЕЦ БЛОКА СИМУЛЯЦИИ ОБЫЧНОГО SEGFAULT ---
-    GlobalContext gctx(out_dir, input_files);
+    GlobalContext gctx(image_file, input_files);
 
 
     int num_threads = MAX_COUNT;
