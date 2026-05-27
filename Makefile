@@ -126,8 +126,9 @@ test_stress: secure_copy
 clean:
 	rm -f *.o *.so secure_copy secure_copy_attack secure_copy_segfault input.txt disk.img
 	rm -f stat.txt log.txt attack_out.log segfault_out.log
+	rm -rf test_env test_edge test_stress_env
 
-.PHONY: all install test_invalid_args test_security test_segfault clean
+.PHONY: all install test_invalid_args test_security test_segfault test_all test_hash test_edge_cases test_stress clean
 
 # Создаём тестовый файл
 input.txt:
