@@ -25,6 +25,7 @@
 
 #include <fcntl.h> // Для O_WRONLY, O_CREAT
 #include "rc4.h" 
+#include "secure_types.h"
 #include <filesystem>
 #include <sys/file.h> // Для функции flock
 
@@ -122,14 +123,7 @@ std::string sanitize_filename(const std::string& name) {
 
 
 
-// Размер строго 24 байта (4 + 4 + 16).
-#pragma pack(push, 1)
-struct ContainerHeader {
-    uint32_t file_length;
-    uint32_t name_length;
-    unsigned char salt[16];
-};
-#pragma pack(pop)
+
 
 // Структура для хранения путей к файлу
 struct FileInfo {
@@ -210,7 +204,7 @@ void* worker_func_add(void* arg) {
         }
 
         // Защита от переполнения 32-битного заголовка (файлы > 4 ГБ)
-        if (st.st_size > UINT32_MAX) {
+        if (static_cast<uint64_t>(st.st_size) > Config::MAX_FILE_SIZE) {
             std::cerr << "[WARNING] Пропущен файл (превышен лимит 4 ГБ): " << file.real_path << "\n";
             continue;
         }
@@ -381,8 +375,7 @@ bool read_next_file_record(int fd, off_t file_size, ContainerHeader& header, std
     if (bytes != sizeof(ContainerHeader)) return false;
 
     // 3. Защита от бесконечного выделения памяти (битый заголовок)
-    const uint32_t MAX_PATH_LEN = 4096;
-    if (header.name_length == 0 || header.name_length > MAX_PATH_LEN) {
+    if (header.name_length == 0 || header.name_length > Config::MAX_PATH_LEN) {
         std::cerr << "\n[ERROR] Обнаружен битый заголовок (неверная длина имени). Чтение остановлено.\n";
         return false;
     }

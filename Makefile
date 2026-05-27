@@ -33,7 +33,7 @@ rc4.o: rc4.c rc4.h
 # ----------------- ПРОГРАММА -----------------
 
 # НОВАЯ ЦЕЛЬ: собираем исполняемый файл. Он зависит от своего .o файла и от библиотеки
-secure_copy: secure_copy.o librc4.so
+secure_copy: secure_copy.o librc4.so secure_types.h
 	$(CXX) $(CXXFLAGS) -o secure_copy secure_copy.o $(APP_LDFLAGS)
 
 # НОВАЯ ЦЕЛЬ: объектный файл программы. 
