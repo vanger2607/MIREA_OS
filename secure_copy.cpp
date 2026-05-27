@@ -16,6 +16,8 @@
 #include <cstring> 
 #include <time.h> // Для clock_gettime
 #include <getopt.h>
+#include <cctype>
+#include <unordered_set>
 
 #include <sys/mman.h>  // Для хранения ключа и безопасного выделения памяти
 #include <signal.h>
@@ -103,6 +105,21 @@ void generate_salt(unsigned char* salt, size_t length = 16) {
         salt[i] = static_cast<unsigned char>(dis(gen));
     }
 }
+
+
+
+/**
+ * Защищает терминал от вывода непечатаемых символов.
+ */
+std::string sanitize_filename(const std::string& name) {
+    std::string safe_name = name;
+    for (char& c : safe_name) {
+        if (!std::isprint(static_cast<unsigned char>(c))) c = '?';
+    }
+    return safe_name;
+}
+
+
 
 
 // Размер строго 24 байта (4 + 4 + 16).
@@ -281,69 +298,272 @@ void* worker_func_add(void* arg) {
 }
 
 
+
 /**
- * Формирует список файлов для архивации на основе переданных путей.
- * Разворачивает директории рекурсивно, вычисляя корректные относительные пути 
- * для записи в заголовок архива, сохраняя структуру вложенности.
+ * Формирует список файлов для архивации.
+ * Применяет политику "Виртуального корня":
+ * - Одиночные файлы сохраняются в корень архива (по имени).
+ * - Директории сохраняют внутреннюю иерархию относительно своего корня.
  */
 std::vector<FileInfo> build_archive_manifest(const std::vector<std::string>& raw_paths) {
     std::vector<FileInfo> manifest;
     
     for (const std::string& input_path : raw_paths) {
-        // 1. Очищаем путь от случайного слэша на конце
         std::string clean_path = input_path;
         if (!clean_path.empty() && (clean_path.back() == '/' || clean_path.back() == '\\')) {
             clean_path.pop_back();
         }
         
         fs::path p(clean_path);
-        std::error_code ec; // Объект для безопасного перехвата ошибок ФС
+        std::error_code ec;
         
-        // 2. Базовая проверка существования
         if (!fs::exists(p, ec)) {
             std::cerr << "[WARNING] Путь не существует или недоступен: " << input_path << "\n";
             continue;
         }
 
         if (fs::is_regular_file(p, ec)) {
-            // Проверка прав на чтение (POSIX)
             if (access(p.c_str(), R_OK) != 0) {
                 std::cerr << "[WARNING] Нет прав на чтение файла: " << input_path << "\n";
                 continue;
             }
             
-            std::string archive_name = "/" + p.relative_path().generic_string();
+            // Политика для файла: берем только базовое имя
+            std::string archive_name = "/" + p.filename().generic_string();
             manifest.push_back({archive_name, p.string()});
         } 
         else if (fs::is_directory(p, ec)) {
-            // Запускаем безопасный итератор, который сам игнорирует запретные папки
             auto options = fs::directory_options::skip_permission_denied;
             
             for (const auto& entry : fs::recursive_directory_iterator(p, options)) {
                 std::error_code entry_ec;
                 
-                // Пропускаем символические ссылки, сокеты, пайпы и устройства (/dev/*)
                 if (fs::is_regular_file(entry, entry_ec)) {
-                    
-                    // Проверка прав на чтение конкретного вложенного файла
                     if (access(entry.path().c_str(), R_OK) != 0) {
                         std::cerr << "[WARNING] Нет прав на чтение файла: " << entry.path().string() << "\n";
                         continue;
                     }
                     
-                    std::string archive_name = "/" + entry.path().relative_path().generic_string();
+                    // Политика для директории: путь строго относительно переданного корня 'p'
+                    std::error_code rel_ec;
+                    fs::path rel_path = fs::relative(entry.path(), p, rel_ec);
+                    if (rel_ec) {
+                        std::cerr << "[WARNING] Ошибка вычисления пути для: " << entry.path().string() << "\n";
+                        continue;
+                    }
+                    
+                    std::string archive_name = "/" + rel_path.generic_string();
                     manifest.push_back({archive_name, entry.path().string()});
                 }
             }
         } 
         else {
-            // Сюда попадут сокеты, именованные каналы (FIFO) и блочные/символьные устройства
             std::cerr << "[WARNING] Игнорируется специальный или системный файл: " << input_path << "\n";
         }
     }
     
     return manifest;
 }
+
+/**
+ * Читает один заголовок и имя файла из образа.
+ * Возвращает true, если чтение прошло успешно, и false, если достигнут конец файла или найдена ошибка.
+ */
+bool read_next_file_record(int fd, off_t file_size, ContainerHeader& header, std::string& filename) {
+    // Узнаем, где мы сейчас находимся в файле
+    off_t current_offset = lseek(fd, 0, SEEK_CUR);
+
+    // 1. Проверяем, влезет ли заголовок (24 байта) до конца файла
+    if (current_offset + (off_t)sizeof(ContainerHeader) > file_size) return false;
+
+    // 2. Читаем заголовок
+    ssize_t bytes = read(fd, &header, sizeof(ContainerHeader));
+    if (bytes != sizeof(ContainerHeader)) return false;
+
+    // 3. Защита от бесконечного выделения памяти (битый заголовок)
+    const uint32_t MAX_PATH_LEN = 4096;
+    if (header.name_length == 0 || header.name_length > MAX_PATH_LEN) {
+        std::cerr << "\n[ERROR] Обнаружен битый заголовок (неверная длина имени). Чтение остановлено.\n";
+        return false;
+    }
+
+    // 4. Проверяем, не оборван ли образ (хватит ли места для имени и самих данных)
+    current_offset = lseek(fd, 0, SEEK_CUR);
+    if (current_offset + header.name_length + header.file_length > file_size) {
+        std::cerr << "\n[ERROR] Образ поврежден или недокачан (неожиданный конец файла).\n";
+        return false;
+    }
+
+    // 5. Выделяем память и читаем имя
+    filename.assign(header.name_length, '\0');
+    bytes = read(fd, &filename[0], header.name_length);
+    if (bytes != (ssize_t)header.name_length) return false;
+
+    return true; // Успех!
+}
+
+/**
+ * Режим -list: Вывод содержимого образа.
+ */
+void list_archive_contents(const std::string& image_file) {
+    int fd = open(image_file.c_str(), O_RDONLY);
+    if (fd < 0) {
+        perror("[ERROR] Не удалось открыть образ");
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size == 0) {
+        std::cerr << "[WARNING] Образ пуст или недоступен.\n";
+        close(fd);
+        return;
+    }
+
+    std::cout << "\n=== Содержимое образа: " << image_file << " ===\n";
+    std::cout << std::left << std::setw(50) << "Имя файла в архиве" << " | " << "Размер (байт)\n";
+    std::cout << std::string(75, '-') << "\n";
+
+    int files_found = 0;
+    uint64_t total_size = 0;
+    ContainerHeader header;
+    std::string filename;
+
+    while (read_next_file_record(fd, st.st_size, header, filename)) {
+        std::string safe_name = sanitize_filename(filename);
+        std::cout << std::left << std::setw(50) << safe_name << " | " << header.file_length << "\n";
+        
+        files_found++;
+        total_size += header.file_length;
+
+        // Прыгаем через данные
+        off_t current_offset = lseek(fd, 0, SEEK_CUR);
+        if (lseek(fd, current_offset + header.file_length, SEEK_SET) == (off_t)-1) break;
+    }
+
+    if (files_found == 0) std::cout << "(Нет файлов или образ поврежден)\n";
+    std::cout << std::string(75, '-') << "\n";
+    std::cout << "Всего файлов: " << files_found << " | Общий объем: " << total_size << " байт\n\n";
+
+    close(fd);
+}
+
+/**
+ * Режим -get: Извлечение и потоковая расшифровка конкретного файла из образа.
+ */
+void extract_file_from_archive(const std::string& image_file, const std::string& target_filename, const std::string& out_file) {
+    // Открываем образ только для чтения
+    int fd = open(image_file.c_str(), O_RDONLY);
+    if (fd < 0) {
+        perror("[ERROR] Не удалось открыть образ");
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size == 0) {
+        std::cerr << "[WARNING] Образ пуст или недоступен.\n";
+        close(fd);
+        return;
+    }
+
+    ContainerHeader header;
+    std::string filename;
+    bool found = false;
+
+    // 1. Ищем файл в архиве с помощью нашего безопасного итератора
+    while (read_next_file_record(fd, st.st_size, header, filename)) {
+        if (filename == target_filename) {
+            found = true;
+            std::cout << "[INFO] Файл '" << filename << "' найден. Начинаем извлечение...\n";
+
+            // 2. БЕЗОПАСНОЕ СОЗДАНИЕ ВЫХОДНОГО ФАЙЛА
+            // O_WRONLY: Только для записи
+            // O_CREAT:  Создать файл, если его нет
+            // O_EXCL:   Эксклюзивный режим. Если файл УЖЕ ЕСТЬ - вернуть ошибку. 
+            //           Это защищает от перезаписи системных файлов и атак по симлинкам!
+            // 0644:     Права доступа к новому файлу (чтение-запись владельцу, остальным только чтение)
+            int out_fd = open(out_file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+            if (out_fd < 0) {
+                if (errno == EEXIST) {
+                    std::cerr << "[ERROR] Файл '" << out_file << "' уже существует. Защита O_EXCL предотвратила перезапись.\n";
+                } else {
+                    perror("[ERROR] Не удалось создать выходной файл");
+                }
+                break;
+            }
+
+            // 3. ВЫДЕЛЕНИЕ ЗАЩИЩЕННОЙ ПАМЯТИ ДЛЯ СОСТОЯНИЯ RC4 (S-блока)
+            size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);
+            void* local_secure_state = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (local_secure_state == MAP_FAILED) {
+                perror("[ERROR] Ошибка mmap при извлечении");
+                close(out_fd);
+                break;
+            }
+            volatile RC4_State* state = static_cast<volatile RC4_State*>(local_secure_state);
+
+            // --- ИНИЦИАЛИЗАЦИЯ ШИФРА---
+            // Снимаем блокировку с глобального ключа (разрешаем чтение)
+            mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_READ);
+
+            size_t actual_key_len = strlen((const char*)global_secure_memory_pointer);
+            rc4_init(state, (const unsigned char*)global_secure_memory_pointer, actual_key_len, header.salt, 16);
+
+            // Возвращаем блокировку ключа (PROT_NONE - ни чтения, ни записи)
+            mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE);
+            // ---------------------------------------
+
+            // 4.Расшифровка
+            uint64_t bytes_left = header.file_length;
+            unsigned char buffer[BLOCK_SIZE];
+
+            while (bytes_left > 0) {
+                // Вычисляем, сколько байт прочитать: либо целый блок 4КБ, либо остаток файла
+                size_t to_read = (bytes_left < BLOCK_SIZE) ? bytes_left : BLOCK_SIZE;
+                
+                ssize_t bytes_read = read(fd, buffer, to_read);
+                if (bytes_read <= 0) {
+                    std::cerr << "\n[ERROR] Неожиданный конец файла при чтении данных.\n";
+                    break;
+                }
+
+                // Расшифровываем считанный кусок в оперативной памяти
+                rc4_crypt(state, buffer, bytes_read);
+                
+                // Пишем расшифрованный кусок на диск
+                // ОС сама сдвигает курсор внутри out_fd при обычном write, поэтому pwrite здесь не нужен
+                if (write(out_fd, buffer, bytes_read) != bytes_read) {
+                    perror("\n[ERROR] Ошибка записи на диск (возможно, закончилось место)");
+                    break;
+                }
+                
+                bytes_left -= bytes_read;
+            }
+
+            // 5. Уничтожение следов
+            // Забиваем нулями перемешанный массив S-блока перед возвратом памяти ядру
+            memset(local_secure_state, 0, PAGE_SIZE);
+            munmap(local_secure_state, PAGE_SIZE);
+            close(out_fd);
+            
+            if (bytes_left == 0) {
+                std::cout << "[OK] Файл успешно расшифрован и сохранен в: " << out_file << "\n";
+            }
+            break; // Мы нашли и обработали нужный файл, выходим из цикла поиска
+        }
+
+        // Если это не наш файл — перепрыгиваем через его зашифрованные данные к следующему заголовку
+        off_t current_offset = lseek(fd, 0, SEEK_CUR);
+        if (lseek(fd, current_offset + header.file_length, SEEK_SET) == (off_t)-1) break;
+    }
+
+    if (!found) {
+        std::cerr << "[ERROR] Файл с именем '" << target_filename << "' не найден в архиве.\n";
+    }
+
+    close(fd);
+}
+
+
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
@@ -359,8 +579,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::string mode = "";
-    std::string key_str = "";
     std::string image_file = "";
+    const char* key_arg = nullptr;
+    size_t key_len = 0;
     std::string out_file = "";
     std::string target_file = "";
     std::vector<std::string> raw_input_files;
@@ -383,7 +604,10 @@ int main(int argc, char* argv[]) {
             case 'a': mode = "-add"; break;
             case 'l': mode = "-list"; break;
             case 'g': mode = "-get"; break;
-            case 'k': key_str = optarg; break; // optarg - это встроенная переменная, содержащая значение аргумента
+            case 'k':
+                key_arg = optarg;
+                key_len = strnlen(optarg, SECURE_MEMORY_SIZE - 1);
+                break;
             case 'i': image_file = optarg; break;
             case 'o': out_file = optarg; break;
             case '?': 
@@ -401,9 +625,9 @@ int main(int argc, char* argv[]) {
     // Валидация обязательных параметров
     bool valid = true;
     if (mode.empty() || image_file.empty()) valid = false;
-    if (mode == "-add" && (key_str.empty() || raw_input_files.empty())) valid = false;
-    if (mode == "-get" && (key_str.empty() || raw_input_files.empty() || out_file.empty())) valid = false;
-    if (mode == "-list" && !key_str.empty()) valid = false; // Для list ключ не нужен
+    if (mode == "-add" && (!key_arg || raw_input_files.empty())) valid = false;
+    if (mode == "-get" && (!key_arg || raw_input_files.empty() || out_file.empty())) valid = false;
+    if (mode == "-list" && key_arg) valid = false; // Для list ключ не нужен
 
     if (!valid) {
         std::cerr << "Usage:\n"
@@ -419,23 +643,25 @@ int main(int argc, char* argv[]) {
         perror("Ошибка выделения защищенной памяти (mmap)");
         return 1;
     }
-    if (!key_str.empty()) {
-        size_t max_len = SECURE_MEMORY_SIZE - 1;
-        
-        if (key_str.length() > max_len) {
-            std::cerr << "[WARNING] Введенный ключ слишком длинный (" << key_str.length() 
-                      << " байт). Он будет обрезан до " << max_len << " байт для обеспечения безопасности памяти.\n";
-        }
-        
-        size_t copy_len = std::min(key_str.length(), max_len);
-        std::memcpy(global_secure_memory_pointer, key_str.c_str(), copy_len);
-        ((char*)global_secure_memory_pointer)[copy_len] = '\0';
+    if (key_arg) {
+    size_t max_len = SECURE_MEMORY_SIZE - 1;
+
+    if (key_len > max_len) {
+        std::cerr << "[WARNING] Введенный ключ слишком длинный (" << key_len
+                  << " байт). Он будет обрезан до " << max_len << " байт.\n";
+
+        key_len = max_len;
     }
-    // Установка защиты "Полная блокировка" (ни чтения, ни записи)
-    if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE) == -1) {
-        perror("Ошибка установки защиты памяти (mprotect PROT_NONE)");
-        return 1;
+
+    std::memcpy(global_secure_memory_pointer, key_arg, key_len);
+    ((char*)global_secure_memory_pointer)[key_len] = '\0';
+
+    // Пытаемся затереть argv-буфер
+    volatile char* p = const_cast<volatile char*>(key_arg);
+    for (size_t i = 0; i < key_len; ++i) {
+        p[i] = '\0';
     }
+}
 
     // --- БЛОК СИМУЛЯЦИИ АТАКИ ---
 #ifdef SIMULATE_ATTACK
@@ -455,13 +681,44 @@ int main(int argc, char* argv[]) {
         
         std::vector<FileInfo> parsed_files = build_archive_manifest(raw_input_files);
 
+        // --- БЛОК ДЕДУПЛИКАЦИИ ---
+        std::unordered_set<std::string> existing_files;
+        int check_fd = open(image_file.c_str(), O_RDONLY);
+        if (check_fd >= 0) {
+            struct stat st;
+            if (fstat(check_fd, &st) == 0 && st.st_size > 0) {
+                ContainerHeader header;
+                std::string filename;
+                while (read_next_file_record(check_fd, st.st_size, header, filename)) {
+                    existing_files.insert(filename); // Запоминаем пути, которые уже есть
+                    off_t cur = lseek(check_fd, 0, SEEK_CUR);
+                    lseek(check_fd, cur + header.file_length, SEEK_SET);
+                }
+            }
+            close(check_fd);
+        }
+
+        // Фильтруем манифест: оставляем только те файлы, которых нет в existing_files
+        std::vector<FileInfo> unique_files;
+        for (const auto& file : parsed_files) {
+            if (existing_files.find(file.archive_name) != existing_files.end()) {
+                std::cerr << "[WARNING] Пропуск дубликата (уже есть в архиве): " << file.archive_name << "\n";
+            } else {
+                unique_files.push_back(file);
+            }
+        }
+        
+        // Перезаписываем манифест очищенным списком
+        parsed_files = std::move(unique_files);
+        // --- КОНЕЦ БЛОКА ДЕДУПЛИКАЦИИ ---
+
         if (parsed_files.empty()) {
-            std::cerr << "Нет файлов для добавления. Завершение.\n";
+            std::cerr << "Нет новых файлов для добавления. Завершение.\n";
             cleanup_secure_memory();
             return 1;
         }
 
-        // 2. Открываем образ контейнера (0600 - доступ ТОЛЬКО владельцу)
+        // 2. Открываем образ контейнера (0600 - только для владельца, без прав на выполнение)
         int fd = open(image_file.c_str(), O_WRONLY | O_CREAT, 0600);
         if (fd < 0) {
             perror("Ошибка открытия образа");
@@ -489,9 +746,14 @@ int main(int argc, char* argv[]) {
         }
         
     } else if (mode == "-list") {
-        std::cout << "Режим -list будет реализован на следующем шаге.\n";
+        list_archive_contents(image_file);
     } else if (mode == "-get") {
-        std::cout << "Режим -get будет реализован на следующем шаге.\n";
+        if (raw_input_files.empty()) {
+            std::cerr << "[ERROR] Не указано имя файла для извлечения из архива.\n";
+            cleanup_secure_memory();
+            return 1;
+        }
+        extract_file_from_archive(image_file, raw_input_files[0], out_file);
     }
     // Очистка при нормальном завершении программы
     cleanup_secure_memory();
