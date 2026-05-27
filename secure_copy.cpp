@@ -19,11 +19,17 @@
 
 #include <sys/mman.h>  // Для хранения ключа и безопасного выделения памяти
 #include <signal.h>
+#include <random>
 
-#include "caesar.h"
+#include <fcntl.h> // Для O_WRONLY, O_CREAT
+#include "rc4.h" 
+#include <filesystem>
+#include <sys/file.h> // Для функции flock
+
+namespace fs = std::filesystem;
 
 const size_t BLOCK_SIZE = 4096;
-const int MAX_COUNT = 4;
+const int MAX_COUNT = 5;
 // Флаг для сигналов остается volatile sig_atomic_t
 volatile sig_atomic_t keep_running = 1;
 
@@ -79,24 +85,61 @@ void handle_sigint(int sig) {
     keep_running = 0; 
 }
 
+#include <random>
+
+// Функция генерации криптографической соли
+void generate_salt(unsigned char* salt, size_t length = 16) {
+    // std::random_device запрашивает энтропию напрямую у операционной системы
+    std::random_device rd;
+    
+    // std::mt19937 — это алгоритм "Вихрь Мерсенна" (Mersenne Twister),
+    std::mt19937 gen(rd());
+    
+    // Настраиваем равномерное распределение, чтобы каждое число было в диапазоне 0 до 255 
+    // (значение одного байта) выпадало с одинаковой вероятностью
+    std::uniform_int_distribution<> dis(0, 255);
+    
+    for (size_t i = 0; i < length; ++i) {
+        salt[i] = static_cast<unsigned char>(dis(gen));
+    }
+}
+
+
+// Размер строго 24 байта (4 + 4 + 16).
+#pragma pack(push, 1)
+struct ContainerHeader {
+    uint32_t file_length;
+    uint32_t name_length;
+    unsigned char salt[16];
+};
+#pragma pack(pop)
+
+// Структура для хранения путей к файлу
+struct FileInfo {
+    std::string archive_name; // Относительный путь для сохранения в архиве (напр. "dir/file.txt")
+    std::string real_path;    // Абсолютный/реальный путь на диске для чтения
+};
 /**
  * ГЛОБАЛЬНЫЙ КОНТЕКСТ:
  * Общие данные для главных потоков.
  */
 struct GlobalContext {
-    std::vector<std::string> input_files;
-    std::string out_dir;
+    std::vector<FileInfo> input_files;
+    int out_fd; // Дескриптор для выходного образа
+
+    std::mutex write_mutex;      // Мьютекс для безопасного бронирования места в образе
     std::mutex key_access_mutex; // Мьютекс для синхронизации изменения прав доступа
     std::atomic<size_t> file_idx{0}; 
     std::mutex log_mutex;
     std::ofstream log_file;
 
-    GlobalContext(const std::string& dir, const std::vector<std::string>& files) 
-        : input_files(files), out_dir(dir) {
+    GlobalContext(int fd, const std::vector<FileInfo>& files) 
+        : input_files(files), out_fd(fd) {
         log_file.open("log.txt", std::ios::app);
     }
     ~GlobalContext() {
         if (log_file.is_open()) log_file.close();
+        if (out_fd >= 0) close(out_fd); // Гарантированное закрытие образа
     }
 };
 
@@ -127,76 +170,155 @@ void log_message(GlobalContext* gctx, const std::string& filename) {
 /**
  * ВЕРХНИЙ ПОТОК (ВОРКЕР)
  */
-void* worker_func(void* arg) {
+void* worker_func_add(void* arg) {
     GlobalContext* gctx = static_cast<GlobalContext*>(arg);
-
+    size_t PAGE_SIZE = sysconf(_SC_PAGESIZE); // Получаем размер страницы для выделения организации доступа к защищенной памяти
+    // Выделяем изолированную страницу памяти для состояния шифра (S-блока)
+    void* local_secure_state = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (local_secure_state == MAP_FAILED) return nullptr;
+    
+    volatile RC4_State* state = static_cast<volatile RC4_State*>(local_secure_state);
     while (keep_running) {
         size_t idx = gctx->file_idx.fetch_add(1, std::memory_order_relaxed);
         if (idx >= gctx->input_files.size()) {
             break;
         }
-        std::string filepath = gctx->input_files[idx];
-        std::string filename = filepath;
-        size_t slash_pos = filepath.find_last_of("/\\");
-        if (slash_pos != std::string::npos) {
-            filename = filepath.substr(slash_pos + 1);
-        }
-        std::string out_filepath = gctx->out_dir + "/" + filename;
+        FileInfo file = gctx->input_files[idx];
 
-        std::ifstream infile(filepath, std::ios::binary);
-        if (!infile) {
-            std::cerr << "\n[ERROR] Файл не существует или недоступен: " << filepath << "\n";
-            std::cerr << "Аварийное завершение программы.\n";
-            cleanup_secure_memory(); // Очищаем память перед аварийным выходом
-            exit(EXIT_FAILURE); 
+        // Узнаем размер исходного файла
+        struct stat st;
+        if (stat(file.real_path.c_str(), &st) != 0) {
+            std::cerr << "[WARNING] Пропущен файл (ошибка доступа): " << file.real_path << "\n";
+            continue;
         }
-        std::ofstream outfile(out_filepath, std::ios::binary);
 
-        if (infile && outfile) {
-            // Создаем буффер (фиксируем длину сообщения)
+        // Защита от переполнения 32-битного заголовка (файлы > 4 ГБ)
+        if (st.st_size > UINT32_MAX) {
+            std::cerr << "[WARNING] Пропущен файл (превышен лимит 4 ГБ): " << file.real_path << "\n";
+            continue;
+        }
+
+        uint32_t file_len = static_cast<uint32_t>(st.st_size);
+        uint32_t name_len = static_cast<uint32_t>(file.archive_name.length());
+        
+        // Генерируем соль для файла
+        unsigned char salt[16];
+        generate_salt(salt);
+        // --- КРИТИЧЕСКАЯ СЕКЦИЯ 1: Инициализация шифра ---
+        gctx->key_access_mutex.lock(); 
+        
+        mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_READ); 
+        mprotect(local_secure_state, PAGE_SIZE, PROT_READ | PROT_WRITE);       
+        
+        size_t actual_key_len = strlen((const char*)global_secure_memory_pointer);
+        rc4_init(state, (const unsigned char*)global_secure_memory_pointer, actual_key_len, salt, 16);
+        
+        mprotect(local_secure_state, PAGE_SIZE, PROT_NONE);                    
+        mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE); 
+        
+        gctx->key_access_mutex.unlock();
+        // --- КОНЕЦ КРИТИЧЕСКОЙ СЕКЦИИ 1 ---
+        // --- КРИТИЧЕСКАЯ СЕКЦИЯ 2: Бронирование места в образе ---
+        off_t data_offset = 0;
+        gctx->write_mutex.lock(); // Блокируем запись в образ для других потоков
+        
+        // Смотрим, где сейчас конец файла-образа
+        off_t current_eof = lseek(gctx->out_fd, 0, SEEK_END);
+        
+        // Собираем заголовок файла
+        ContainerHeader header = {file_len, name_len, {0}};
+        memcpy(header.salt, salt, 16);
+        
+        // Пишем Заголовок и Имя файла в конец образа
+        write(gctx->out_fd, &header, sizeof(header));
+        write(gctx->out_fd, file.archive_name.c_str(), name_len);
+        
+        // Вычисляем, куда именно этот поток будет писать зашифрованные данные
+        data_offset = current_eof + sizeof(header) + name_len;
+        
+        // Резервируем место под данные на диске (чтобы потоки не перемешали байты)
+        if (ftruncate(gctx->out_fd, data_offset + file_len) == -1) {
+            std::cerr << "\n[CRITICAL ERROR] Не удалось выделить место на диске для " << file.archive_name << "\n";
+            gctx->write_mutex.unlock();
+            keep_running = 0; // Тормозим всю программу
+            continue;
+        }
+        
+        gctx->write_mutex.unlock(); // Отпускаем образ для других потоков
+        // --- КОНЕЦ КРИТИЧЕСКОЙ СЕКЦИИ 2 ---
+
+
+        // 3. Асинхронное чтение, шифрование и запись (БЕЗ мьютексов)
+        int fd_in = open(file.real_path.c_str(), O_RDONLY);
+        if (fd_in >= 0) {
             unsigned char buffer[BLOCK_SIZE];
-            while (keep_running && infile) {
-                // пытаемся прочитать блок в наш буффер
-                infile.read(reinterpret_cast<char*>(buffer), BLOCK_SIZE);
-                // смотрим сколько реально прочитали
-                size_t read_bytes = infile.gcount();
-                if (read_bytes > 0) {
-                    
-                    // --- КРИТИЧЕСКАЯ СЕКЦИЯ ШИФРОВАНИЯ ---
-                    gctx->key_access_mutex.lock(); 
+            off_t write_cursor = data_offset; // Начинаем писать с забронированного места
+            
+            while (keep_running) {
+                // Читаем блок из исходного файла
+                ssize_t bytes = read(fd_in, buffer, BLOCK_SIZE);
+                if (bytes <= 0) break; // Файл закончился
 
-                    // 1. Открываем защищенную память только для чтения
-                    if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_READ) == -1) {
-                        perror("Ошибка mprotect (разрешение чтения)");
-                        cleanup_secure_memory();
-                        exit(EXIT_FAILURE);
-                    }
-                    
-                    // 2. Передаем указатель в библиотеку
-                    caesar(buffer, buffer, (int)read_bytes, (volatile char*)global_secure_memory_pointer);
-                    
-                    // 3. Закрываем доступ
-                    if (mprotect(global_secure_memory_pointer, SECURE_MEMORY_SIZE, PROT_NONE) == -1) {
-                        perror("Ошибка mprotect (запрет доступа)");
-                        cleanup_secure_memory();
-                        exit(EXIT_FAILURE);
-                    }
+                // Открываем локальный S-блок, шифруем и сразу закрываем
+                mprotect(local_secure_state, PAGE_SIZE, PROT_READ | PROT_WRITE);
+                rc4_crypt(state, buffer, bytes);
+                mprotect(local_secure_state, PAGE_SIZE, PROT_NONE);
 
-                    gctx->key_access_mutex.unlock();
-                    // --- КОНЕЦ КРИТИЧЕСКОЙ СЕКЦИИ ---
-
-                    // пишем ровно столько байт, сколько было прочитано
-                    outfile.write(reinterpret_cast<char*>(buffer), read_bytes);
-                }
+                // Пишем зашифрованный блок в образ строго по своему смещению (write_cursor)
+                pwrite(gctx->out_fd, buffer, bytes, write_cursor);
+                write_cursor += bytes; // Сдвигаем курсор для следующего блока
             }
-        }
-
-        if (keep_running) {
-            log_message(gctx, filename);
+            close(fd_in);
+            
+            log_message(gctx, file.archive_name);
         }
     }
+    mprotect(local_secure_state, PAGE_SIZE, PROT_READ | PROT_WRITE);
+    memset(local_secure_state, 0, PAGE_SIZE); // Затираем пароли нулями
+    munmap(local_secure_state, PAGE_SIZE);
+
     return nullptr;
 }
+
+
+/**
+ * Формирует список файлов для архивации на основе переданных путей.
+ * Разворачивает директории рекурсивно, вычисляя корректные относительные пути 
+ * для записи в заголовок архива, сохраняя структуру вложенности.
+ */
+std::vector<FileInfo> build_archive_manifest(const std::vector<std::string>& raw_paths) {
+    std::vector<FileInfo> manifest;
+    
+    for (const std::string& input_path : raw_paths) {
+        fs::path p(input_path);
+        
+        if (fs::is_regular_file(p)) {
+            // Если передан одиночный файл, берем только его базовое имя (без пути).
+            // Пример: "/home/user/file.txt" -> "file.txt"
+            manifest.push_back({p.filename().string(), p.string()});
+        } 
+        else if (fs::is_directory(p)) {
+            // Если передана директория, запускаем рекурсивный итератор по всем вложенным папкам
+            for (const auto& entry : fs::recursive_directory_iterator(p)) {
+                if (fs::is_regular_file(entry)) {
+                    // Вычисляем путь файла относительно родительской папки исходного аргумента.
+                    // Это гарантирует, что если мы передали папку "in/", 
+                    // файл внутри нее получит правильное имя "in/dir/file.txt",
+                    // что соответствует требованию сохранения абсолютного пути в рамках директории.
+                    std::string rel_path = fs::relative(entry.path(), p.parent_path()).string();
+                    manifest.push_back({rel_path, entry.path().string()});
+                }
+            }
+        } 
+        else {
+            std::cerr << "[WARNING] Игнорируется неизвестный тип пути (не файл и не директория): " 
+                      << input_path << "\n";
+        }
+    }
+    
+    return manifest;
+}
+
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, handle_sigint); // регистрация обработчика Ctrl + c
@@ -216,7 +338,7 @@ int main(int argc, char* argv[]) {
     std::string image_file = "";
     std::string out_file = "";
     std::string target_file = "";
-    std::vector<std::string> input_files;
+    std::vector<std::string> raw_input_files;
 
     struct option long_options[] = {
         {"add",   no_argument,       0, 'a'},
@@ -248,14 +370,14 @@ int main(int argc, char* argv[]) {
     // Сбор свободных аргументов (позиционных), которые идут без флагов (file1.txt, dir/ и т.д.)
     // После работы getopt_long_only, индекс optind указывает на первый свободный аргумент
     for (int i = optind; i < argc; ++i) {
-        input_files.push_back(argv[i]);
+        raw_input_files.push_back(argv[i]);
     }
 
     // Валидация обязательных параметров
     bool valid = true;
     if (mode.empty() || image_file.empty()) valid = false;
-    if (mode == "-add" && (key_str.empty() || input_files.empty())) valid = false;
-    if (mode == "-get" && (key_str.empty() || input_files.empty() || out_file.empty())) valid = false;
+    if (mode == "-add" && (key_str.empty() || raw_input_files.empty())) valid = false;
+    if (mode == "-get" && (key_str.empty() || raw_input_files.empty() || out_file.empty())) valid = false;
     if (mode == "-list" && !key_str.empty()) valid = false; // Для list ключ не нужен
 
     if (!valid) {
@@ -303,18 +425,50 @@ int main(int argc, char* argv[]) {
         *bad_pointer = 'X'; // Спровоцирует обычный SIGSEGV (адрес 0x0)
     #endif
     // --- КОНЕЦ БЛОКА СИМУЛЯЦИИ ОБЫЧНОГО SEGFAULT ---
-    GlobalContext gctx(image_file, input_files);
+    // --- МАРШРУТИЗАЦИЯ ПО РЕЖИМАМ ---
+    if (mode == "-add") {
+        std::vector<FileInfo> parsed_files;
+        
+        std::vector<FileInfo> parsed_files = build_archive_manifest(raw_input_files);
 
-
-    int num_threads = MAX_COUNT;
-
-        pthread_t workers[MAX_COUNT];
-        for (int i = 0; i < num_threads; ++i) {
-            pthread_create(&workers[i], nullptr, worker_func, &gctx);
+        if (parsed_files.empty()) {
+            std::cerr << "Нет файлов для добавления. Завершение.\n";
+            cleanup_secure_memory();
+            return 1;
         }
-        for (int i = 0; i < num_threads; ++i) {
+
+        // 2. Открываем образ контейнера (0600 - доступ ТОЛЬКО владельцу)
+        int fd = open(image_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd < 0) {
+            perror("Ошибка открытия образа");
+            cleanup_secure_memory();
+            return 1;
+        }
+
+        // 3. Блокировка файла от других процессов (File Lock)
+        if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+            std::cerr << "[ERROR] Файл образа '" << image_file << "' уже занят другой программой!\n";
+            close(fd);
+            cleanup_secure_memory();
+            return 1;
+        }
+
+        // 4. Инициализация Глобального контекста и запуск воркеров
+        GlobalContext gctx(fd, parsed_files);
+        
+        pthread_t workers[MAX_COUNT];
+        for (int i = 0; i < MAX_COUNT; ++i) {
+            pthread_create(&workers[i], nullptr, worker_func_add, &gctx); 
+        }
+        for (int i = 0; i < MAX_COUNT; ++i) {
             pthread_join(workers[i], nullptr);
         }
+        
+    } else if (mode == "-list") {
+        std::cout << "Режим -list будет реализован на следующем шаге.\n";
+    } else if (mode == "-get") {
+        std::cout << "Режим -get будет реализован на следующем шаге.\n";
+    }
     // Очистка при нормальном завершении программы
     cleanup_secure_memory();
 
