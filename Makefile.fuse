@@ -1,0 +1,31 @@
+CXX = g++
+CC = gcc
+
+# Базовые флаги компилятора
+CXXFLAGS = -Wall -Wextra -pedantic -O2 -pthread -std=c++20 -Wno-missing-field-initializers
+CFLAGS = -Wall -Wextra -pedantic -O2 -fPIC -std=c11
+
+# Автоматически достаем пути и флаги для FUSE 3
+FUSE_CFLAGS = $$(pkg-config fuse3 --cflags)
+FUSE_LIBS = $$(pkg-config fuse3 --libs)
+
+# Флаги линковщика для нашей криптографии (librc4.so в текущей папке)
+APP_LDFLAGS = -L. -lrc4 -Wl,-rpath,.
+
+# Главная цель
+all: librc4.so fuse
+
+# 1. Сборка динамической библиотеки RC4
+librc4.so: rc4.c rc4.h
+	$(CC) $(CFLAGS) -shared rc4.c -o librc4.so
+
+# 2. Сборка FUSE-драйвера
+fuse: fuse.cpp secure_types.h librc4.so
+	$(CXX) $(CXXFLAGS) $(FUSE_CFLAGS) fuse.cpp -o fuse $(APP_LDFLAGS) $(FUSE_LIBS)
+
+# Очистка мусора
+clean:
+	rm -f fuse *.o *.so disk.img
+	rm -rf /tmp/my_vault
+
+.PHONY: all clean

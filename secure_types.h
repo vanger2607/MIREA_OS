@@ -16,3 +16,9 @@ struct ContainerHeader {
     unsigned char salt[16];
 };
 #pragma pack(pop)
+// Виртуальный узел (Virtual File System) для демона FUSE
+struct VirtualFile {
+    uint32_t size;              // Размер расшифрованного файла
+    unsigned char salt[16];     // Индивидуальная соль файла
+    off_t data_offset;          // Физическое смещение зашифрованных данных внутри disk.img
+};
